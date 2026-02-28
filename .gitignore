@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+*.pyc
+backend/.env
+backend/venv
+backend/data/store.json
