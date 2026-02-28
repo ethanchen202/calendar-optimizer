@@ -1,0 +1,245 @@
+@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap");
+
+:root {
+  --bg-top: #f3e8cf;
+  --bg-bottom: #f9faf7;
+  --panel: #ffffff;
+  --text: #1f2a22;
+  --muted: #546057;
+  --line: #d2d8d1;
+  --accent: #146c5a;
+  --accent-strong: #0f4f42;
+  --danger: #b42318;
+  --shadow: 0 20px 45px rgba(23, 36, 30, 0.08);
+  --radius: 16px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-family: "Space Grotesk", "Segoe UI", sans-serif;
+  color: var(--text);
+  background:
+    radial-gradient(circle at 8% 4%, rgba(20, 108, 90, 0.1), transparent 28%),
+    radial-gradient(circle at 92% 0%, rgba(210, 112, 42, 0.12), transparent 22%),
+    linear-gradient(170deg, var(--bg-top), var(--bg-bottom));
+}
+
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+
+.app-shell {
+  width: min(1100px, calc(100vw - 2rem));
+  margin: 1.5rem auto 3rem;
+  display: grid;
+  gap: 1rem;
+}
+
+.hero {
+  padding: 1.5rem 1.5rem 1.35rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: linear-gradient(140deg, #f0f8f6, #fff7eb);
+  box-shadow: var(--shadow);
+}
+
+.hero h1 {
+  margin-top: 0.5rem;
+  margin-bottom: 0.4rem;
+  font-size: clamp(1.4rem, 2.4vw, 2.1rem);
+  line-height: 1.2;
+  max-width: 26ch;
+}
+
+.hero p {
+  color: var(--muted);
+  max-width: 72ch;
+}
+
+.kicker {
+  display: inline-flex;
+  padding: 0.25rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid #c2d4cb;
+  color: var(--accent-strong);
+  font-size: 0.76rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.panel {
+  padding: 1rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--panel) 86%, #f6fff4 14%);
+  box-shadow: var(--shadow);
+}
+
+.panel h2 {
+  margin-bottom: 0.75rem;
+  font-size: 1.08rem;
+}
+
+.panel h3 {
+  margin-top: 0.85rem;
+  margin-bottom: 0.45rem;
+  font-size: 0.95rem;
+}
+
+.grid {
+  display: grid;
+  gap: 0.8rem;
+}
+
+.grid.two {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.stack {
+  display: grid;
+  gap: 0.7rem;
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+label {
+  display: grid;
+  gap: 0.32rem;
+  font-size: 0.9rem;
+}
+
+input,
+textarea,
+select {
+  font: inherit;
+  width: 100%;
+  border: 1px solid #b8c6bc;
+  border-radius: 10px;
+  background: #fff;
+  padding: 0.58rem 0.64rem;
+  color: var(--text);
+}
+
+textarea {
+  resize: vertical;
+}
+
+input:focus,
+textarea:focus,
+select:focus {
+  outline: 2px solid rgba(20, 108, 90, 0.25);
+  border-color: var(--accent);
+}
+
+button {
+  font: inherit;
+  border: 0;
+  border-radius: 10px;
+  padding: 0.56rem 0.86rem;
+  background: var(--accent);
+  color: #effbf6;
+  cursor: pointer;
+  transition: transform 0.12s ease, background 0.2s ease;
+}
+
+button:hover {
+  transform: translateY(-1px);
+  background: var(--accent-strong);
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.7;
+  transform: none;
+}
+
+.check-label {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.check-label input {
+  width: auto;
+}
+
+.list {
+  list-style: none;
+  display: grid;
+  gap: 0.55rem;
+  margin: 0.75rem 0 0;
+  padding: 0;
+}
+
+.list li {
+  border: 1px solid #ced8d0;
+  border-radius: 12px;
+  padding: 0.58rem 0.68rem;
+  background: #fbfdf9;
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 0.75rem;
+}
+
+.list li p {
+  color: var(--muted);
+  font-size: 0.86rem;
+  margin-top: 0.2rem;
+  word-break: break-word;
+}
+
+.list.compact li {
+  padding: 0.45rem 0.58rem;
+}
+
+.list li button {
+  padding: 0.38rem 0.62rem;
+  font-size: 0.82rem;
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.status,
+.error {
+  margin-top: 0.58rem;
+  padding: 0.56rem 0.68rem;
+  border-radius: 10px;
+  font-size: 0.86rem;
+  font-family: "IBM Plex Mono", monospace;
+}
+
+.status {
+  border: 1px solid #c4dbc5;
+  background: #edf7ee;
+  color: #255436;
+}
+
+.error {
+  border: 1px solid #efb9b6;
+  background: #fff1f0;
+  color: var(--danger);
+}
+
+@media (max-width: 920px) {
+  .grid.two {
+    grid-template-columns: 1fr;
+  }
+}
+

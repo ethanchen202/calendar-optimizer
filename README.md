@@ -145,4 +145,41 @@ backend/
   data/
   requirements.txt
   .env.example
+frontend/
+  src/
+    App.tsx        # MVP single-page UI
+    api.ts         # Backend API client
+    types.ts       # Shared frontend types
+    styles.css
+  package.json
+  .env.example
 ```
+
+## Frontend MVP
+Tech stack: `React + TypeScript + Vite`.
+
+What the frontend supports:
+1. Configure `backend URL` and `user ID`.
+2. Add/delete tasks and sync task JSON to backend.
+3. Save user energy description text.
+4. Add current calendar events, generate schedule JSON, and render results.
+5. Submit and view periodic user check-ins.
+
+### Run frontend
+From repo root:
+
+```bash
+cd frontend
+cp .env.example .env
+npm install
+npm run dev
+```
+
+Open frontend at:
+- `http://localhost:5173`
+
+By default it calls backend at:
+- `http://localhost:8000`
+
+If your backend uses a different URL, update it in the UI Connection panel or set:
+- `VITE_API_BASE_URL` in `frontend/.env`

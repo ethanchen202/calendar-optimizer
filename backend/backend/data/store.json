@@ -1,0 +1,34 @@
+{
+  "users": {
+    "user_123": {
+      "tasks": [
+        {
+          "id": "play_clash_1772305598901",
+          "title": "play clash",
+          "duration_minutes": 180,
+          "priority": 1,
+          "deadline": "2026-03-01T19:05:00Z",
+          "preferred_time_window": {
+            "start_hour": 16,
+            "end_hour": 19
+          },
+          "split_allowed": true
+        },
+        {
+          "id": "play_badminton_1772305627896",
+          "title": "play badminton",
+          "duration_minutes": 180,
+          "priority": 1,
+          "deadline": "2026-03-02T19:06:00Z",
+          "preferred_time_window": {
+            "start_hour": 12,
+            "end_hour": 15
+          },
+          "split_allowed": true
+        }
+      ],
+      "energy_profile": "I feel focused from 4-8 pm and tired from 1-3 pm",
+      "checkins": []
+    }
+  }
+}
