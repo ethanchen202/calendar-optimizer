@@ -1,5 +1,8 @@
 import type {
   CalendarEvent,
+  ChatAnalyzeResponse,
+  ChatApplyResponse,
+  ChatDelta,
   MessageResponse,
   ScheduleResponse,
   Task,
@@ -35,6 +38,13 @@ export class ApiClient {
       `/api/v1/tasks/${encodeURIComponent(taskId)}?${query.toString()}`,
       { method: "DELETE" }
     );
+  }
+
+  async syncCalendar(userId: string, events: CalendarEvent[]): Promise<UserState> {
+    return this.request<UserState>("/api/v1/calendar/sync", {
+      method: "POST",
+      body: { user_id: userId, events }
+    });
   }
 
   async updateEnergyProfile(userId: string, description: string): Promise<MessageResponse> {
@@ -82,6 +92,33 @@ export class ApiClient {
     });
   }
 
+  async analyzeChat(input: {
+    userId: string;
+    message: string;
+    timezone: string;
+    useAI: boolean;
+  }): Promise<ChatAnalyzeResponse> {
+    return this.request<ChatAnalyzeResponse>("/api/v1/chat/analyze", {
+      method: "POST",
+      body: {
+        user_id: input.userId,
+        message: input.message,
+        timezone: input.timezone,
+        use_ai: input.useAI
+      }
+    });
+  }
+
+  async applyChatDelta(input: { userId: string; delta: ChatDelta }): Promise<ChatApplyResponse> {
+    return this.request<ChatApplyResponse>("/api/v1/chat/apply-delta", {
+      method: "POST",
+      body: {
+        user_id: input.userId,
+        delta: input.delta
+      }
+    });
+  }
+
   async health(): Promise<{ status: string; ai_provider: string }> {
     return this.request<{ status: string; ai_provider: string }>("/health");
   }
@@ -109,4 +146,3 @@ export class ApiClient {
     return payload as T;
   }
 }
-

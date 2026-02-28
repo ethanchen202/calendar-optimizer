@@ -29,6 +29,7 @@ export type CheckinRecord = {
 export type UserState = {
   user_id: string;
   tasks: Task[];
+  calendar_events: CalendarEvent[];
   energy_profile?: string | null;
   checkins: CheckinRecord[];
 };
@@ -59,3 +60,28 @@ export type MessageResponse = {
   message: string;
 };
 
+export type ChatDelta = {
+  tasks_add: Task[];
+  task_ids_remove: string[];
+  task_title_contains_remove: string[];
+  calendar_add: CalendarEvent[];
+  calendar_ids_remove: string[];
+  calendar_title_contains_remove: string[];
+  energy_profile_append?: string | null;
+  energy_profile_replace?: string | null;
+};
+
+export type ChatAnalyzeResponse = {
+  user_id: string;
+  assistant_message: string;
+  detected_emotions: string[];
+  proposed_delta: ChatDelta;
+  requires_confirmation: boolean;
+  delta_preview: string[];
+  updated_energy_profile?: string | null;
+};
+
+export type ChatApplyResponse = {
+  message: string;
+  user_state: UserState;
+};

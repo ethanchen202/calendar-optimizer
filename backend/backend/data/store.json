@@ -25,10 +25,20 @@
             "end_hour": 15
           },
           "split_allowed": true
+        },
+        {
+          "id": "math_homework_task_new",
+          "title": "math homework",
+          "duration_minutes": 180,
+          "priority": 3,
+          "deadline": "2026-03-05T05:59:59Z",
+          "preferred_time_window": null,
+          "split_allowed": true
         }
       ],
-      "energy_profile": "I feel focused from 4-8 pm and tired from 1-3 pm",
-      "checkins": []
+      "energy_profile": "I feel focused from 4-8 pm and tired from 1-3 pm\nI'm feeling tired.\nChat mood update (2026-02-28): user reported feeling tired.",
+      "checkins": [],
+      "calendar_events": []
     }
   }
 }

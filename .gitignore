@@ -7,3 +7,4 @@ backend/data/store.json
 frontend/.env
 frontend/node_modules/
 frontend/dist/
+*.tsbuildinfo

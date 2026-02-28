@@ -166,6 +166,15 @@ button:disabled {
   transform: none;
 }
 
+.button-secondary {
+  background: #dbe7e0;
+  color: #19392f;
+}
+
+.button-secondary:hover {
+  background: #c8d9d0;
+}
+
 .check-label {
   display: flex;
   align-items: center;
@@ -237,9 +246,53 @@ button:disabled {
   color: var(--danger);
 }
 
+.chat-log {
+  margin-top: 0.7rem;
+  margin-bottom: 0.8rem;
+  padding: 0.55rem;
+  border: 1px solid #ccd8ce;
+  border-radius: 10px;
+  background: #fdfefb;
+  display: grid;
+  gap: 0.45rem;
+  max-height: 250px;
+  overflow-y: auto;
+}
+
+.chat-turn {
+  border: 1px solid #d6dfd9;
+  border-radius: 9px;
+  padding: 0.5rem 0.58rem;
+  background: #ffffff;
+}
+
+.chat-turn.user {
+  background: #f3faf7;
+}
+
+.chat-turn.assistant {
+  background: #fff9f0;
+}
+
+.chat-turn strong {
+  font-size: 0.8rem;
+}
+
+.chat-turn p {
+  margin-top: 0.2rem;
+  color: var(--text);
+}
+
+.delta-box {
+  margin-top: 0.8rem;
+  padding: 0.7rem;
+  border: 1px solid #c4d8cc;
+  border-radius: 12px;
+  background: #f3fbf6;
+}
+
 @media (max-width: 920px) {
   .grid.two {
     grid-template-columns: 1fr;
   }
 }
-

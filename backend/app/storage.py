@@ -34,6 +34,7 @@ class JsonStore:
         users = state.setdefault("users", {})
         user_state = users.setdefault(user_id, {})
         user_state.setdefault("tasks", [])
+        user_state.setdefault("calendar_events", [])
         user_state.setdefault("energy_profile", None)
         user_state.setdefault("checkins", [])
         return user_state
@@ -44,6 +45,7 @@ class JsonStore:
             user_state = self._ensure_user(state, user_id)
             return {
                 "tasks": user_state["tasks"],
+                "calendar_events": user_state["calendar_events"],
                 "energy_profile": user_state["energy_profile"],
                 "checkins": user_state["checkins"],
             }
@@ -65,6 +67,13 @@ class JsonStore:
             if deleted:
                 self._write_state(state)
             return deleted
+
+    def sync_calendar_events(self, user_id: str, events: list[dict[str, Any]]) -> None:
+        with self._lock:
+            state = self._read_state()
+            user_state = self._ensure_user(state, user_id)
+            user_state["calendar_events"] = events
+            self._write_state(state)
 
     def update_energy_profile(self, user_id: str, description: str) -> None:
         with self._lock:
@@ -93,3 +102,93 @@ class JsonStore:
             )
             self._write_state(state)
 
+    def apply_chat_delta(
+        self,
+        user_id: str,
+        delta: dict[str, Any],
+        apply_energy_update: bool = True,
+    ) -> dict[str, Any]:
+        with self._lock:
+            state = self._read_state()
+            user_state = self._ensure_user(state, user_id)
+
+            tasks_by_id = {
+                str(task.get("id", "")).strip(): task
+                for task in user_state["tasks"]
+                if str(task.get("id", "")).strip()
+            }
+            for task in delta.get("tasks_add", []):
+                task_id = str(task.get("id", "")).strip()
+                if task_id:
+                    tasks_by_id[task_id] = task
+
+            remove_ids = {
+                str(task_id).strip()
+                for task_id in delta.get("task_ids_remove", [])
+                if str(task_id).strip()
+            }
+            remove_keywords = [
+                str(keyword).strip().lower()
+                for keyword in delta.get("task_title_contains_remove", [])
+                if str(keyword).strip()
+            ]
+            user_state["tasks"] = [
+                task
+                for task in tasks_by_id.values()
+                if task.get("id") not in remove_ids
+                and not any(keyword in str(task.get("title", "")).lower() for keyword in remove_keywords)
+            ]
+
+            events_by_id = {
+                str(event.get("id", "")).strip(): event
+                for event in user_state["calendar_events"]
+                if str(event.get("id", "")).strip()
+            }
+            for event in delta.get("calendar_add", []):
+                event_id = str(event.get("id", "")).strip()
+                if event_id:
+                    events_by_id[event_id] = event
+                else:
+                    synthetic_id = f"calendar_{len(events_by_id) + 1}"
+                    event_copy = dict(event)
+                    event_copy["id"] = synthetic_id
+                    events_by_id[synthetic_id] = event_copy
+
+            remove_event_ids = {
+                str(event_id).strip()
+                for event_id in delta.get("calendar_ids_remove", [])
+                if str(event_id).strip()
+            }
+            remove_event_keywords = [
+                str(keyword).strip().lower()
+                for keyword in delta.get("calendar_title_contains_remove", [])
+                if str(keyword).strip()
+            ]
+            user_state["calendar_events"] = [
+                event
+                for event in events_by_id.values()
+                if event.get("id") not in remove_event_ids
+                and not any(
+                    keyword in str(event.get("title", "")).lower() for keyword in remove_event_keywords
+                )
+            ]
+
+            if apply_energy_update:
+                if delta.get("energy_profile_replace"):
+                    user_state["energy_profile"] = str(delta["energy_profile_replace"]).strip()
+                elif delta.get("energy_profile_append"):
+                    note = str(delta["energy_profile_append"]).strip()
+                    if note:
+                        existing = str(user_state.get("energy_profile") or "").strip()
+                        if existing:
+                            user_state["energy_profile"] = f"{existing}\n{note}"
+                        else:
+                            user_state["energy_profile"] = note
+
+            self._write_state(state)
+            return {
+                "tasks": user_state["tasks"],
+                "calendar_events": user_state["calendar_events"],
+                "energy_profile": user_state["energy_profile"],
+                "checkins": user_state["checkins"],
+            }

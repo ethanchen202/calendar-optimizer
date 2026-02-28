@@ -45,6 +45,11 @@ class TasksSyncRequest(BaseModel):
     tasks: list[Task] = Field(default_factory=list)
 
 
+class CalendarSyncRequest(BaseModel):
+    user_id: str = Field(..., min_length=1, max_length=128)
+    events: list[CalendarEvent] = Field(default_factory=list)
+
+
 class EnergyProfileUpdateRequest(BaseModel):
     user_id: str = Field(..., min_length=1, max_length=128)
     description: str = Field(..., min_length=5, max_length=4000)
@@ -95,13 +100,69 @@ class CheckinRecord(BaseModel):
     submitted_at: datetime
 
 
+class ChatDelta(BaseModel):
+    tasks_add: list[Task] = Field(default_factory=list)
+    task_ids_remove: list[str] = Field(default_factory=list)
+    task_title_contains_remove: list[str] = Field(default_factory=list)
+    calendar_add: list[CalendarEvent] = Field(default_factory=list)
+    calendar_ids_remove: list[str] = Field(default_factory=list)
+    calendar_title_contains_remove: list[str] = Field(default_factory=list)
+    energy_profile_append: str | None = Field(default=None, max_length=1000)
+    energy_profile_replace: str | None = Field(default=None, max_length=4000)
+
+    @model_validator(mode="after")
+    def validate_energy_ops(self) -> "ChatDelta":
+        if self.energy_profile_append and self.energy_profile_replace:
+            raise ValueError("Only one of energy_profile_append or energy_profile_replace may be set")
+        return self
+
+    def requires_confirmation(self) -> bool:
+        return any(
+            (
+                self.tasks_add,
+                self.task_ids_remove,
+                self.task_title_contains_remove,
+                self.calendar_add,
+                self.calendar_ids_remove,
+                self.calendar_title_contains_remove,
+            )
+        )
+
+
+class ChatAnalyzeRequest(BaseModel):
+    user_id: str = Field(..., min_length=1, max_length=128)
+    message: str = Field(..., min_length=1, max_length=4000)
+    timezone: str = Field(default="UTC", min_length=1, max_length=64)
+    use_ai: bool = True
+
+
+class ChatAnalyzeResponse(BaseModel):
+    user_id: str
+    assistant_message: str
+    detected_emotions: list[str] = Field(default_factory=list)
+    proposed_delta: ChatDelta = Field(default_factory=ChatDelta)
+    requires_confirmation: bool = False
+    delta_preview: list[str] = Field(default_factory=list)
+    updated_energy_profile: str | None = None
+
+
+class ChatApplyRequest(BaseModel):
+    user_id: str = Field(..., min_length=1, max_length=128)
+    delta: ChatDelta
+
+
+class ChatApplyResponse(BaseModel):
+    message: str
+    user_state: "UserStateResponse"
+
+
 class UserStateResponse(BaseModel):
     user_id: str
     tasks: list[Task] = Field(default_factory=list)
+    calendar_events: list[CalendarEvent] = Field(default_factory=list)
     energy_profile: str | None = None
     checkins: list[CheckinRecord] = Field(default_factory=list)
 
 
 class MessageResponse(BaseModel):
     message: str
-

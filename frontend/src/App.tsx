@@ -3,13 +3,21 @@ import type { FormEvent } from "react";
 import { ApiClient } from "./api";
 import type {
   CalendarEvent,
+  ChatDelta,
   CheckinRecord,
   ScheduleResponse,
-  Task
+  Task,
+  UserState
 } from "./types";
 
 const DEFAULT_API_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
 const DEFAULT_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+
+type ChatTurn = {
+  role: "user" | "assistant";
+  text: string;
+  timestamp: string;
+};
 
 function App() {
   const [apiBaseUrl, setApiBaseUrl] = useState(() => {
@@ -49,11 +57,20 @@ function App() {
   const [checkinFeedback, setCheckinFeedback] = useState("");
   const [checkinSatisfaction, setCheckinSatisfaction] = useState("");
 
+  const [chatInput, setChatInput] = useState("");
+  const [chatTurns, setChatTurns] = useState<ChatTurn[]>([]);
+  const [chatEmotions, setChatEmotions] = useState<string[]>([]);
+  const [pendingChatDelta, setPendingChatDelta] = useState<ChatDelta | null>(null);
+  const [pendingDeltaPreview, setPendingDeltaPreview] = useState<string[]>([]);
+
   const [isLoadingState, setIsLoadingState] = useState(false);
   const [isSavingTasks, setIsSavingTasks] = useState(false);
+  const [isSavingCalendar, setIsSavingCalendar] = useState(false);
   const [isSavingEnergy, setIsSavingEnergy] = useState(false);
   const [isGeneratingSchedule, setIsGeneratingSchedule] = useState(false);
   const [isSubmittingCheckin, setIsSubmittingCheckin] = useState(false);
+  const [isAnalyzingChat, setIsAnalyzingChat] = useState(false);
+  const [isApplyingChatDelta, setIsApplyingChatDelta] = useState(false);
 
   const api = useMemo(() => new ApiClient(apiBaseUrl), [apiBaseUrl]);
 
@@ -74,17 +91,34 @@ function App() {
     setErrorMessage("");
   };
 
-  const withErrorHandling = (message: string) => {
-    clearMessages();
-    setStatusMessage(message);
-  };
-
   function requireUserId(): string {
     const trimmed = userId.trim();
     if (!trimmed) {
       throw new Error("User ID is required.");
     }
     return trimmed;
+  }
+
+  function applyUserState(state: UserState) {
+    setTasks(state.tasks);
+    setCalendarEvents(state.calendar_events ?? []);
+    const profile = state.energy_profile ?? "";
+    setEnergyProfile(profile);
+    if (!scheduleDescription.trim()) {
+      setScheduleDescription(profile);
+    }
+    setCheckins(state.checkins);
+  }
+
+  function pushChatTurn(role: "user" | "assistant", text: string) {
+    setChatTurns((current) => [
+      ...current,
+      {
+        role,
+        text,
+        timestamp: new Date().toISOString()
+      }
+    ]);
   }
 
   async function checkBackendHealth() {
@@ -102,13 +136,7 @@ function App() {
       setIsLoadingState(true);
       const uid = requireUserId();
       const state = await api.getUserState(uid);
-      setTasks(state.tasks);
-      const profile = state.energy_profile ?? "";
-      setEnergyProfile(profile);
-      if (!scheduleDescription.trim()) {
-        setScheduleDescription(profile);
-      }
-      setCheckins(state.checkins);
+      applyUserState(state);
       setStatusMessage("Loaded state from backend.");
     } catch (error) {
       setErrorMessage(getErrorMessage(error));
@@ -123,12 +151,27 @@ function App() {
       clearMessages();
       const uid = requireUserId();
       const state = await api.syncTasks(uid, nextTasks);
-      setTasks(state.tasks);
+      applyUserState(state);
       setStatusMessage(successMessage);
     } catch (error) {
       setErrorMessage(getErrorMessage(error));
     } finally {
       setIsSavingTasks(false);
+    }
+  }
+
+  async function saveCalendar(nextEvents: CalendarEvent[], successMessage: string) {
+    try {
+      setIsSavingCalendar(true);
+      clearMessages();
+      const uid = requireUserId();
+      const state = await api.syncCalendar(uid, nextEvents);
+      applyUserState(state);
+      setStatusMessage(successMessage);
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error));
+    } finally {
+      setIsSavingCalendar(false);
     }
   }
 
@@ -200,7 +243,7 @@ function App() {
   async function handleSaveEnergyProfile(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     try {
-      withErrorHandling("Saving energy profile...");
+      clearMessages();
       setIsSavingEnergy(true);
       const uid = requireUserId();
       await api.updateEnergyProfile(uid, energyProfile);
@@ -215,7 +258,7 @@ function App() {
     }
   }
 
-  function handleAddCalendarEvent(event: FormEvent<HTMLFormElement>) {
+  async function handleAddCalendarEvent(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     try {
       const title = eventTitle.trim();
@@ -232,30 +275,31 @@ function App() {
         throw new Error("Calendar event end must be after start.");
       }
 
-      setCalendarEvents((current) => [
-        ...current,
+      const nextEvents = [
+        ...calendarEvents,
         {
           id: `event_${Date.now()}`,
           title,
           start: startDate.toISOString(),
           end: endDate.toISOString()
         }
-      ]);
+      ];
+
+      await saveCalendar(nextEvents, "Added and synced current calendar event.");
       setEventTitle("");
       setEventStart("");
       setEventEnd("");
-      setStatusMessage("Added current calendar event.");
-      setErrorMessage("");
     } catch (error) {
       setErrorMessage(getErrorMessage(error));
     }
   }
 
-  function handleDeleteCalendarEvent(eventId: string | null | undefined) {
+  async function handleDeleteCalendarEvent(eventId: string | null | undefined) {
     if (!eventId) {
       return;
     }
-    setCalendarEvents((current) => current.filter((item) => item.id !== eventId));
+    const nextEvents = calendarEvents.filter((item) => item.id !== eventId);
+    await saveCalendar(nextEvents, "Removed and synced calendar event.");
   }
 
   async function handleGenerateSchedule(event: FormEvent<HTMLFormElement>) {
@@ -314,14 +358,88 @@ function App() {
     }
   }
 
+  async function handleAnalyzeChat(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    try {
+      clearMessages();
+      setIsAnalyzingChat(true);
+      const uid = requireUserId();
+      const message = chatInput.trim();
+      if (!message) {
+        throw new Error("Chat message cannot be empty.");
+      }
+
+      pushChatTurn("user", message);
+      setChatInput("");
+
+      const response = await api.analyzeChat({
+        userId: uid,
+        message,
+        timezone,
+        useAI
+      });
+
+      pushChatTurn("assistant", response.assistant_message);
+      setChatEmotions(response.detected_emotions);
+
+      if (response.updated_energy_profile !== null && response.updated_energy_profile !== undefined) {
+        setEnergyProfile(response.updated_energy_profile);
+        if (!scheduleDescription.trim()) {
+          setScheduleDescription(response.updated_energy_profile);
+        }
+      }
+
+      if (response.requires_confirmation && hasStructuralDeltaChanges(response.proposed_delta)) {
+        setPendingChatDelta(response.proposed_delta);
+        setPendingDeltaPreview(response.delta_preview);
+        setStatusMessage("Chatbot proposed a delta. Confirm to apply changes.");
+      } else {
+        setPendingChatDelta(null);
+        setPendingDeltaPreview([]);
+        setStatusMessage("Chat analyzed. No confirmation-required changes pending.");
+      }
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error));
+    } finally {
+      setIsAnalyzingChat(false);
+    }
+  }
+
+  async function handleConfirmDelta() {
+    try {
+      if (!pendingChatDelta) {
+        return;
+      }
+      clearMessages();
+      setIsApplyingChatDelta(true);
+      const uid = requireUserId();
+      const response = await api.applyChatDelta({ userId: uid, delta: pendingChatDelta });
+      applyUserState(response.user_state);
+      setPendingChatDelta(null);
+      setPendingDeltaPreview([]);
+      pushChatTurn("assistant", "Applied confirmed changes.");
+      setStatusMessage(response.message);
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error));
+    } finally {
+      setIsApplyingChatDelta(false);
+    }
+  }
+
+  function handleRejectDelta() {
+    setPendingChatDelta(null);
+    setPendingDeltaPreview([]);
+    setStatusMessage("Pending chatbot delta was discarded.");
+  }
+
   return (
     <div className="app-shell">
       <header className="hero">
         <p className="kicker">Calendar Optimizer MVP</p>
         <h1>Design your schedule around your energy, not just your to-do list.</h1>
         <p>
-          Tasks and user profile are persisted in your FastAPI backend. Generated schedules are
-          returned as JSON and rendered below.
+          Tasks, current calendar, energy profile, and check-ins are persisted in your FastAPI
+          backend. The chatbot can propose deltas and requires explicit confirmation.
         </p>
       </header>
 
@@ -356,6 +474,68 @@ function App() {
         </div>
         {statusMessage ? <p className="status">{statusMessage}</p> : null}
         {errorMessage ? <p className="error">{errorMessage}</p> : null}
+      </section>
+
+      <section className="panel">
+        <h2>Chatbot</h2>
+        <p className="muted">
+          Ask naturally (examples: "I am exhausted today", "add task finish ML homework for 90
+          minutes", "remove task play clash", "add event | Deep Work | 2026-03-01 16:00 |
+          2026-03-01 18:00").
+        </p>
+
+        {chatEmotions.length > 0 ? (
+          <p className="muted">Detected emotions: {chatEmotions.join(", ")}</p>
+        ) : null}
+
+        <div className="chat-log">
+          {chatTurns.length === 0 ? (
+            <p className="muted">No chat messages yet.</p>
+          ) : (
+            chatTurns.map((turn) => (
+              <div key={`${turn.timestamp}_${turn.role}_${turn.text}`} className={`chat-turn ${turn.role}`}>
+                <strong>{turn.role === "user" ? "You" : "Assistant"}</strong>
+                <p>{turn.text}</p>
+              </div>
+            ))
+          )}
+        </div>
+
+        <form onSubmit={handleAnalyzeChat} className="stack">
+          <label>
+            Message
+            <textarea
+              value={chatInput}
+              onChange={(event) => setChatInput(event.target.value)}
+              rows={3}
+              placeholder="Tell the assistant how you feel or what to change."
+            />
+          </label>
+          <button type="submit" disabled={isAnalyzingChat}>
+            {isAnalyzingChat ? "Analyzing..." : "Send to Chatbot"}
+          </button>
+        </form>
+
+        {pendingChatDelta ? (
+          <div className="delta-box">
+            <h3>Pending Delta (Confirm Required)</h3>
+            <ul className="list compact">
+              {pendingDeltaPreview.length === 0 ? (
+                <li>Changes detected but preview is empty.</li>
+              ) : (
+                pendingDeltaPreview.map((line) => <li key={line}>{line}</li>)
+              )}
+            </ul>
+            <div className="row">
+              <button type="button" disabled={isApplyingChatDelta} onClick={() => void handleConfirmDelta()}>
+                {isApplyingChatDelta ? "Applying..." : "Confirm Changes"}
+              </button>
+              <button type="button" className="button-secondary" onClick={handleRejectDelta}>
+                Reject
+              </button>
+            </div>
+          </div>
+        ) : null}
       </section>
 
       <div className="grid two">
@@ -514,7 +694,9 @@ function App() {
                 />
               </label>
             </div>
-            <button type="submit">Add Calendar Event</button>
+            <button type="submit" disabled={isSavingCalendar}>
+              {isSavingCalendar ? "Saving..." : "Add Calendar Event"}
+            </button>
           </form>
 
           <ul className="list compact">
@@ -527,7 +709,7 @@ function App() {
                     {new Date(event.end).toLocaleString()}
                   </p>
                 </div>
-                <button type="button" onClick={() => handleDeleteCalendarEvent(event.id)}>
+                <button type="button" onClick={() => void handleDeleteCalendarEvent(event.id)}>
                   Remove
                 </button>
               </li>
@@ -688,6 +870,17 @@ function slugify(value: string): string {
     .slice(0, 24);
 }
 
+function hasStructuralDeltaChanges(delta: ChatDelta): boolean {
+  return Boolean(
+    delta.tasks_add.length > 0 ||
+      delta.task_ids_remove.length > 0 ||
+      delta.task_title_contains_remove.length > 0 ||
+      delta.calendar_add.length > 0 ||
+      delta.calendar_ids_remove.length > 0 ||
+      delta.calendar_title_contains_remove.length > 0
+  );
+}
+
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error) {
     return error.message;
@@ -696,3 +889,4 @@ function getErrorMessage(error: unknown): string {
 }
 
 export default App;
+

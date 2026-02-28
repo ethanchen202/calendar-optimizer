@@ -6,9 +6,11 @@ Tech stack: `Python + FastAPI + Pydantic`.
 
 The backend now supports:
 1. Task create/update sync + delete from frontend JSON.
-2. User free-text daily energy description storage.
-3. Schedule generation from current calendar + tasks + description.
+2. Calendar event sync for current busy schedule context.
+3. User free-text daily energy description storage.
 4. Periodic user check-ins for schedule feedback.
+5. Chatbot analysis with emotion detection + delta proposals.
+6. Schedule generation from current calendar + tasks + description.
 
 If Gemini is configured, the backend tries Gemini first; otherwise it falls back to a deterministic heuristic scheduler.
 
@@ -124,7 +126,80 @@ Sample response:
 }
 ```
 
-### 6) Read current user state
+### 6) Sync calendar events
+`POST /api/v1/calendar/sync`
+
+```json
+{
+  "user_id": "user_123",
+  "events": [
+    {
+      "id": "class_1",
+      "title": "Lecture",
+      "start": "2026-03-01T10:00:00-06:00",
+      "end": "2026-03-01T11:30:00-06:00"
+    }
+  ]
+}
+```
+
+### 7) Analyze chatbot message (emotion + delta detection)
+`POST /api/v1/chat/analyze`
+
+```json
+{
+  "user_id": "user_123",
+  "message": "I feel exhausted and please remove task play clash",
+  "timezone": "America/Chicago",
+  "use_ai": true
+}
+```
+
+Sample response:
+
+```json
+{
+  "user_id": "user_123",
+  "assistant_message": "I parsed requested changes. Review the proposed delta and confirm to apply it.",
+  "detected_emotions": ["tired"],
+  "proposed_delta": {
+    "tasks_add": [],
+    "task_ids_remove": [],
+    "task_title_contains_remove": ["play clash"],
+    "calendar_add": [],
+    "calendar_ids_remove": [],
+    "calendar_title_contains_remove": [],
+    "energy_profile_append": null,
+    "energy_profile_replace": null
+  },
+  "requires_confirmation": true,
+  "delta_preview": [
+    "Remove tasks whose title contains \"play clash\"."
+  ],
+  "updated_energy_profile": "..."
+}
+```
+
+### 8) Apply confirmed chatbot delta
+`POST /api/v1/chat/apply-delta`
+
+```json
+{
+  "user_id": "user_123",
+  "delta": {
+    "tasks_add": [],
+    "task_ids_remove": [],
+    "task_title_contains_remove": ["play clash"],
+    "calendar_add": [],
+    "calendar_ids_remove": [],
+    "calendar_title_contains_remove": [],
+    "energy_profile_append": null,
+    "energy_profile_replace": null
+  }
+}
+```
+
+### 9) Read current user state
 `GET /api/v1/state/{user_id}`
 
 ## Environment variables
@@ -162,8 +237,10 @@ What the frontend supports:
 1. Configure `backend URL` and `user ID`.
 2. Add/delete tasks and sync task JSON to backend.
 3. Save user energy description text.
-4. Add current calendar events, generate schedule JSON, and render results.
-5. Submit and view periodic user check-ins.
+4. Add/remove current calendar events and sync to backend.
+5. Chatbot with emotion detection and delta confirmation workflow.
+6. Generate schedule JSON and render results.
+7. Submit and view periodic user check-ins.
 
 ### Run frontend
 From repo root:
