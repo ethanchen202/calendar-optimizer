@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
-from typing import Any
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .ai_client import GeminiSchedulerClient
-from .models import CalendarEvent, ChatAnalyzeResponse, ChatDelta, Task
+from .energy_profile import parse_description_to_intervals
+from .models import CalendarEvent, ChatAnalyzeResponse, ChatDelta, EnergyInterval, EnergyRecurrence, Task
 
 EMOTION_KEYWORDS: dict[str, tuple[str, ...]] = {
     "happy": ("happy", "great", "good", "excited", "motivated", "energized"),
@@ -16,12 +17,21 @@ EMOTION_KEYWORDS: dict[str, tuple[str, ...]] = {
     "sad": ("sad", "down", "depressed", "low"),
 }
 
+EMOTION_ENERGY_LEVEL = {
+    "happy": 2,
+    "calm": 1,
+    "stressed": -2,
+    "tired": -3,
+    "frustrated": -2,
+    "sad": -2,
+}
+
 
 def analyze_chat_message(
     user_id: str,
     message: str,
     timezone_name: str,
-    user_state: dict[str, Any],
+    user_state: dict[str, object],
     use_ai: bool,
     gemini_client: GeminiSchedulerClient,
 ) -> ChatAnalyzeResponse:
@@ -33,11 +43,11 @@ def analyze_chat_message(
         "existing_energy_profile": user_state.get("energy_profile"),
     }
 
-    ai_result: dict[str, Any] | None = None
+    ai_result: dict[str, object] | None = None
     if use_ai and gemini_client.enabled:
         ai_result = gemini_client.analyze_chat_delta(ai_payload)
 
-    parsed = _coerce_chat_result(message, ai_result, user_state)
+    parsed = _coerce_chat_result(message, timezone_name, ai_result, gemini_client, user_state)
     delta = parsed["delta"]
     detected_emotions = parsed["detected_emotions"]
     assistant_message = parsed["assistant_message"]
@@ -55,21 +65,30 @@ def analyze_chat_message(
 
 
 def _coerce_chat_result(
-    user_message: str, ai_result: dict[str, Any] | None, user_state: dict[str, Any]
-) -> dict[str, Any]:
+    user_message: str,
+    timezone_name: str,
+    ai_result: dict[str, object] | None,
+    gemini_client: GeminiSchedulerClient,
+    user_state: dict[str, object],
+) -> dict[str, object]:
     if ai_result:
         try:
             candidate_delta = ChatDelta.model_validate(ai_result.get("delta", {}))
-            emotions = [str(item).strip().lower() for item in ai_result.get("detected_emotions", []) if str(item).strip()]
+            emotions = [
+                str(item).strip().lower()
+                for item in ai_result.get("detected_emotions", [])
+                if str(item).strip()
+            ]
             assistant_message = str(ai_result.get("assistant_message") or "").strip()
             if not assistant_message:
                 assistant_message = _default_assistant_reply(candidate_delta)
-
             if not emotions:
                 emotions = _detect_emotions(user_message)
-            if not candidate_delta.energy_profile_append and not candidate_delta.energy_profile_replace:
-                candidate_delta.energy_profile_append = _energy_append_from_emotions(emotions)
-
+            if not candidate_delta.energy_intervals_add and not candidate_delta.energy_interval_ids_remove:
+                candidate_delta.energy_intervals_add = _energy_intervals_from_emotions(
+                    emotions,
+                    timezone_name=timezone_name,
+                )
             return {
                 "delta": candidate_delta,
                 "detected_emotions": emotions,
@@ -78,11 +97,13 @@ def _coerce_chat_result(
         except Exception:
             pass
 
-    fallback_delta = _fallback_delta(user_message, user_state)
+    fallback_delta = _fallback_delta(user_message, timezone_name, gemini_client, user_state)
     fallback_emotions = _detect_emotions(user_message)
-    if not fallback_delta.energy_profile_append and not fallback_delta.energy_profile_replace:
-        fallback_delta.energy_profile_append = _energy_append_from_emotions(fallback_emotions)
-
+    if not fallback_delta.energy_intervals_add and not fallback_delta.energy_interval_ids_remove:
+        fallback_delta.energy_intervals_add = _energy_intervals_from_emotions(
+            fallback_emotions,
+            timezone_name=timezone_name,
+        )
     return {
         "delta": fallback_delta,
         "detected_emotions": fallback_emotions,
@@ -93,10 +114,10 @@ def _coerce_chat_result(
 def _default_assistant_reply(delta: ChatDelta) -> str:
     structural_changes = delta.requires_confirmation()
     if structural_changes:
-        return "I parsed requested changes. Review the proposed delta and confirm to apply it."
-    if delta.energy_profile_append or delta.energy_profile_replace:
-        return "I updated your energy profile based on your mood and message."
-    return "I understood your message. No task or calendar changes were detected."
+        return "I parsed requested task/calendar changes. Please review and confirm the delta."
+    if delta.energy_intervals_add or delta.energy_interval_ids_remove or delta.energy_clear_all:
+        return "I updated your energy profile intervals based on your message."
+    return "I understood your message. No task/calendar changes were detected."
 
 
 def _detect_emotions(message: str) -> list[str]:
@@ -108,15 +129,34 @@ def _detect_emotions(message: str) -> list[str]:
     return detected
 
 
-def _energy_append_from_emotions(emotions: list[str]) -> str | None:
+def _energy_intervals_from_emotions(emotions: list[str], timezone_name: str) -> list[EnergyInterval]:
     if not emotions:
-        return None
-    joined = ", ".join(emotions)
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    return f"Chat mood update ({timestamp}): user reported feeling {joined}."
+        return []
+    tz = _resolve_timezone(timezone_name)
+    now_local = datetime.now(tz)
+    end_local = min(now_local + timedelta(hours=4), now_local.replace(hour=23, minute=59, second=0, microsecond=0))
+    energy = int(round(sum(EMOTION_ENERGY_LEVEL.get(emotion, 0) for emotion in emotions) / len(emotions)))
+    energy = max(-5, min(5, energy))
+    return [
+        EnergyInterval(
+            id=f"energy_chat_{int(now_local.timestamp())}",
+            start_time=f"{now_local.hour:02d}:{now_local.minute:02d}",
+            end_time=f"{end_local.hour:02d}:{end_local.minute:02d}",
+            energy_level=energy,
+            hard_block=energy <= -5,
+            label="Mood update",
+            notes=f"Detected emotions: {', '.join(emotions)}",
+            recurrence=EnergyRecurrence(type="specific_date", date=now_local.date()),
+        )
+    ]
 
 
-def _fallback_delta(message: str, user_state: dict[str, Any]) -> ChatDelta:
+def _fallback_delta(
+    message: str,
+    timezone_name: str,
+    gemini_client: GeminiSchedulerClient,
+    user_state: dict[str, object],
+) -> ChatDelta:
     lowered = message.lower()
     delta = ChatDelta()
 
@@ -129,19 +169,20 @@ def _fallback_delta(message: str, user_state: dict[str, Any]) -> ChatDelta:
             priority_match = re.search(r"priority\s*(\d)", lowered)
             duration = int(duration_match.group(1)) if duration_match else 60
             priority = int(priority_match.group(1)) if priority_match else 3
-            task = Task(
-                id=f"chat_task_{int(datetime.now(timezone.utc).timestamp())}",
-                title=title[:200],
-                duration_minutes=max(15, min(720, duration)),
-                priority=max(1, min(5, priority)),
-                split_allowed=True,
+            delta.tasks_add.append(
+                Task(
+                    id=f"chat_task_{int(datetime.now(timezone.utc).timestamp())}",
+                    title=title[:200],
+                    duration_minutes=max(15, min(720, duration)),
+                    priority=max(1, min(5, priority)),
+                    split_allowed=True,
+                )
             )
-            delta.tasks_add.append(task)
 
     remove_task_match = re.search(r"(?:remove|delete)\s+task\s*[:\-]?\s*(.+)", message, flags=re.IGNORECASE)
     if remove_task_match:
         target = remove_task_match.group(1).strip()
-        existing_task_ids = {str(task.get("id", "")).strip() for task in user_state.get("tasks", [])}
+        existing_task_ids = {str(task.get("id", "")).strip() for task in user_state.get("tasks", []) if isinstance(task, dict)}
         if target in existing_task_ids:
             delta.task_ids_remove.append(target)
         elif target:
@@ -154,14 +195,11 @@ def _fallback_delta(message: str, user_state: dict[str, Any]) -> ChatDelta:
     )
     if add_event_match:
         payload = add_event_match.group(1).strip()
-        parts = [part.strip() for part in payload.split("|")]
-        parts = [part for part in parts if part]
+        parts = [part.strip() for part in payload.split("|") if part.strip()]
         if len(parts) >= 3:
             title = parts[0]
-            start_raw = parts[1]
-            end_raw = parts[2]
-            start_iso = _coerce_datetime(start_raw)
-            end_iso = _coerce_datetime(end_raw)
+            start_iso = _coerce_datetime(parts[1])
+            end_iso = _coerce_datetime(parts[2])
             if title and start_iso and end_iso:
                 delta.calendar_add.append(
                     CalendarEvent(
@@ -180,49 +218,29 @@ def _fallback_delta(message: str, user_state: dict[str, Any]) -> ChatDelta:
     if remove_event_match:
         target = remove_event_match.group(1).strip()
         existing_event_ids = {
-            str(event.get("id", "")).strip() for event in user_state.get("calendar_events", [])
+            str(event.get("id", "")).strip()
+            for event in user_state.get("calendar_events", [])
+            if isinstance(event, dict)
         }
         if target in existing_event_ids:
             delta.calendar_ids_remove.append(target)
         elif target:
             delta.calendar_title_contains_remove.append(target.lower())
 
-    replace_energy_match = re.search(
-        r"(?:set|replace)\s+(?:my\s+)?energy\s+profile\s*[:\-]?\s*(.+)",
-        message,
-        flags=re.IGNORECASE,
+    intervals, _ = parse_description_to_intervals(
+        description=message,
+        timezone_name=timezone_name,
+        use_ai=False,
+        gemini_client=gemini_client,
     )
-    if replace_energy_match:
-        profile_text = replace_energy_match.group(1).strip()
-        if profile_text:
-            delta.energy_profile_replace = profile_text
-
+    delta.energy_intervals_add.extend(intervals)
     return delta
-
-
-def _coerce_datetime(raw_value: str) -> str | None:
-    normalized = raw_value.strip()
-    if not normalized:
-        return None
-
-    # Supports straightforward ISO-like text used in MVP chat prompts.
-    normalized = normalized.replace(" ", "T")
-    try:
-        parsed = datetime.fromisoformat(normalized)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.isoformat()
 
 
 def build_delta_preview(delta: ChatDelta) -> list[str]:
     preview: list[str] = []
-
     for task in delta.tasks_add:
-        preview.append(
-            f'Add task "{task.title}" ({task.duration_minutes}m, priority {task.priority}).'
-        )
+        preview.append(f'Add task "{task.title}" ({task.duration_minutes}m, priority {task.priority}).')
     for task_id in delta.task_ids_remove:
         preview.append(f"Remove task by id: {task_id}.")
     for keyword in delta.task_title_contains_remove:
@@ -237,9 +255,36 @@ def build_delta_preview(delta: ChatDelta) -> list[str]:
     for keyword in delta.calendar_title_contains_remove:
         preview.append(f'Remove calendar events whose title contains "{keyword}".')
 
-    if delta.energy_profile_replace:
-        preview.append("Replace energy profile from chat mood/context.")
-    elif delta.energy_profile_append:
-        preview.append("Append mood note to energy profile.")
+    for interval in delta.energy_intervals_add:
+        preview.append(
+            f'Update energy interval "{interval.start_time}-{interval.end_time}" '
+            f"level {interval.energy_level} ({interval.recurrence.type})."
+        )
+    for interval_id in delta.energy_interval_ids_remove:
+        preview.append(f"Remove energy interval by id: {interval_id}.")
+    if delta.energy_clear_all:
+        preview.append("Clear all existing energy intervals.")
 
     return preview
+
+
+def _resolve_timezone(timezone_name: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        return ZoneInfo("UTC")
+
+
+def _coerce_datetime(raw_value: str) -> str | None:
+    normalized = raw_value.strip()
+    if not normalized:
+        return None
+    normalized = normalized.replace(" ", "T")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.isoformat()
+

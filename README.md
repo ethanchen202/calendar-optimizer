@@ -1,22 +1,170 @@
 # calendar-optimizer
-AI-backed scheduling that optimizes tasks around user energy rhythms.
+Calendar optimization app with a deterministic heuristic scheduler and structured energy profile JSON.
 
-## Backend MVP (Implemented)
-Tech stack: `Python + FastAPI + Pydantic`.
+## What Changed
+1. Energy profile is now structured JSON, not a single long text string.
+2. Chatbot and energy text updates both map into the same interval-based energy profile.
+3. Scheduling is heuristic-only (no AI scheduling path).
+4. Chat still uses Gemini (optional) for language understanding.
 
-The backend now supports:
-1. Task create/update sync + delete from frontend JSON.
-2. Calendar event sync for current busy schedule context.
-3. User free-text daily energy description storage.
-4. Periodic user check-ins for schedule feedback.
-5. Chatbot analysis with emotion detection + delta proposals.
-6. Schedule generation from current calendar + tasks + description.
+## Energy Profile JSON Design
+Each user has an `energy_profile` object:
 
-If Gemini is configured, the backend tries Gemini first; otherwise it falls back to a deterministic heuristic scheduler.
+```json
+{
+  "version": 1,
+  "timezone": "America/Chicago",
+  "intervals": [],
+  "freeform_notes": null,
+  "updated_at": "2026-02-28T21:00:00+00:00"
+}
+```
 
-## Run backend
-From repo root:
+Each interval has:
+- `id`
+- `start_time` (`HH:MM`)
+- `end_time` (`HH:MM`)
+- `energy_level` (`-5` to `5`)
+- `hard_block` (`true` means do not schedule)
+- `recurrence` rule
 
+### Recurrence types
+- `daily`
+- `weekly` with `days_of_week` (`0=Mon ... 6=Sun`)
+- `specific_date` with `date`
+- `date_range` with `start_date`, `end_date`, optional `days_of_week`
+- `monthly_nth_weekday` with `week_of_month` + `weekday`
+- `monthly_weekdays` with `week_of_month` + optional `days_of_week`
+
+### Example: regular productive/tired windows
+```json
+{
+  "id": "focus_evening",
+  "start_time": "16:00",
+  "end_time": "20:00",
+  "energy_level": 3,
+  "hard_block": false,
+  "label": "Peak focus",
+  "recurrence": { "type": "daily" }
+}
+```
+
+```json
+{
+  "id": "slump_afternoon",
+  "start_time": "13:00",
+  "end_time": "15:00",
+  "energy_level": -3,
+  "hard_block": false,
+  "label": "Afternoon slump",
+  "recurrence": { "type": "daily" }
+}
+```
+
+### Example: “busy on 3rd week of every month”
+```json
+{
+  "id": "monthly_busy_week_3",
+  "start_time": "00:00",
+  "end_time": "23:59",
+  "energy_level": -5,
+  "hard_block": true,
+  "label": "3rd week busy",
+  "recurrence": {
+    "type": "monthly_weekdays",
+    "week_of_month": 3,
+    "days_of_week": [0, 1, 2, 3, 4, 5, 6]
+  }
+}
+```
+
+### Example: “test next week Monday 2-4 pm, too tired rest of day”
+```json
+[
+  {
+    "id": "test_block",
+    "start_time": "14:00",
+    "end_time": "16:00",
+    "energy_level": -5,
+    "hard_block": true,
+    "label": "Test",
+    "recurrence": { "type": "specific_date", "date": "2026-03-02" }
+  },
+  {
+    "id": "post_test_tired",
+    "start_time": "16:00",
+    "end_time": "23:59",
+    "energy_level": -4,
+    "hard_block": false,
+    "label": "Post-test fatigue",
+    "recurrence": { "type": "specific_date", "date": "2026-03-02" }
+  }
+]
+```
+
+## Scheduling Algorithm (Heuristic Only)
+The scheduler is deterministic and uses:
+1. Tasks (priority, duration, deadline, split/non-split, preferred window)
+2. Existing calendar events (hard occupied intervals)
+3. Structured energy intervals (recurring + date-specific)
+
+Core strategy:
+1. Build planning horizon in local timezone.
+2. Sort tasks by urgency score:
+   - high priority first
+   - then tighter deadline
+3. Split splittable tasks into bounded chunks (roughly 30-90 min).
+4. Search candidate slots in 15-minute steps.
+5. Reject slots that:
+   - overlap calendar/events
+   - violate hard energy blocks
+   - miss deadline
+6. Score remaining slots by:
+   - average/minimum energy in slot
+   - priority and deadline slack
+   - preferred-time overlap
+   - continuity with same-task chunks
+   - overloading penalty for already-heavy days
+7. Assign best slot, reserve it, continue until task is complete or unschedulable.
+
+Output includes:
+- `schedule_events`
+- `unscheduled_tasks` with explicit reasons
+
+## API Endpoints
+
+### Sync tasks
+`POST /api/v1/tasks/sync`
+
+### Sync calendar
+`POST /api/v1/calendar/sync`
+
+### Update energy profile from text/profile JSON
+`POST /api/v1/energy-profile`
+
+Text update example:
+```json
+{
+  "user_id": "user_123",
+  "description": "I generally feel productive from 4-8 pm and tired from 1-3 pm.",
+  "mode": "merge",
+  "use_ai": true
+}
+```
+
+### Analyze chatbot message
+`POST /api/v1/chat/analyze`
+
+### Apply confirmed chatbot delta
+`POST /api/v1/chat/apply-delta`
+
+### Generate schedule
+`POST /api/v1/schedule/generate`
+
+### Read user state
+`GET /api/v1/state/{user_id}`
+
+## Run Backend
 ```bash
 cd backend
 python3 -m venv .venv
@@ -26,225 +174,7 @@ cp .env.example .env
 uvicorn app.main:app --reload --port 8000
 ```
 
-Open API docs at:
-- `http://localhost:8000/docs`
-
-## API payload design
-
-### 1) Sync tasks
-`POST /api/v1/tasks/sync`
-
-```json
-{
-  "user_id": "user_123",
-  "tasks": [
-    {
-      "id": "task_write_report",
-      "title": "Write product report",
-      "duration_minutes": 120,
-      "priority": 5,
-      "deadline": "2026-03-03T22:00:00-06:00",
-      "preferred_time_window": { "start_hour": 16, "end_hour": 20 },
-      "split_allowed": true
-    }
-  ]
-}
-```
-
-### 2) Delete task
-`DELETE /api/v1/tasks/{task_id}?user_id=user_123`
-
-### 3) Update energy profile
-`POST /api/v1/energy-profile`
-
-```json
-{
-  "user_id": "user_123",
-  "description": "I generally feel most productive from 4-8 pm and unusually tired from 1-3 pm."
-}
-```
-
-### 4) Generate schedule
-`POST /api/v1/schedule/generate`
-
-```json
-{
-  "user_id": "user_123",
-  "current_calendar": [
-    {
-      "id": "class_1",
-      "title": "Lecture",
-      "start": "2026-03-01T10:00:00-06:00",
-      "end": "2026-03-01T11:30:00-06:00"
-    }
-  ],
-  "new_tasks": [
-    {
-      "id": "task_alg_hw",
-      "title": "Algorithms homework",
-      "duration_minutes": 90,
-      "priority": 4,
-      "split_allowed": true
-    }
-  ],
-  "user_description": "Best focus 4-8 pm, low energy 1-3 pm.",
-  "planning_horizon_days": 7,
-  "timezone": "America/Chicago",
-  "use_ai": true
-}
-```
-
-Sample response:
-
-```json
-{
-  "user_id": "user_123",
-  "generated_at": "2026-02-28T18:10:11.215447+00:00",
-  "strategy_used": "heuristic",
-  "schedule_events": [
-    {
-      "id": "sched_task_alg_hw_1",
-      "title": "Focus: Algorithms homework",
-      "task_id": "task_alg_hw",
-      "start": "2026-03-01T16:00:00-06:00",
-      "end": "2026-03-01T17:00:00-06:00",
-      "source": "heuristic"
-    }
-  ],
-  "unscheduled_tasks": []
-}
-```
-
-### 5) Submit periodic feedback/check-in
-`POST /api/v1/checkins`
-
-```json
-{
-  "user_id": "user_123",
-  "feedback": "This schedule is better in afternoons but mornings are overloaded.",
-  "satisfaction": 4
-}
-```
-
-### 6) Sync calendar events
-`POST /api/v1/calendar/sync`
-
-```json
-{
-  "user_id": "user_123",
-  "events": [
-    {
-      "id": "class_1",
-      "title": "Lecture",
-      "start": "2026-03-01T10:00:00-06:00",
-      "end": "2026-03-01T11:30:00-06:00"
-    }
-  ]
-}
-```
-
-### 7) Analyze chatbot message (emotion + delta detection)
-`POST /api/v1/chat/analyze`
-
-```json
-{
-  "user_id": "user_123",
-  "message": "I feel exhausted and please remove task play clash",
-  "timezone": "America/Chicago",
-  "use_ai": true
-}
-```
-
-Sample response:
-
-```json
-{
-  "user_id": "user_123",
-  "assistant_message": "I parsed requested changes. Review the proposed delta and confirm to apply it.",
-  "detected_emotions": ["tired"],
-  "proposed_delta": {
-    "tasks_add": [],
-    "task_ids_remove": [],
-    "task_title_contains_remove": ["play clash"],
-    "calendar_add": [],
-    "calendar_ids_remove": [],
-    "calendar_title_contains_remove": [],
-    "energy_profile_append": null,
-    "energy_profile_replace": null
-  },
-  "requires_confirmation": true,
-  "delta_preview": [
-    "Remove tasks whose title contains \"play clash\"."
-  ],
-  "updated_energy_profile": "..."
-}
-```
-
-### 8) Apply confirmed chatbot delta
-`POST /api/v1/chat/apply-delta`
-
-```json
-{
-  "user_id": "user_123",
-  "delta": {
-    "tasks_add": [],
-    "task_ids_remove": [],
-    "task_title_contains_remove": ["play clash"],
-    "calendar_add": [],
-    "calendar_ids_remove": [],
-    "calendar_title_contains_remove": [],
-    "energy_profile_append": null,
-    "energy_profile_replace": null
-  }
-}
-```
-
-### 9) Read current user state
-`GET /api/v1/state/{user_id}`
-
-## Environment variables
-- `GEMINI_API_KEY`: Optional. Enables Gemini scheduling attempt.
-- `GEMINI_MODEL`: Optional. Default `gemini-1.5-flash`.
-- `DATA_STORE_PATH`: Optional path to JSON persistence store. Default `backend/data/store.json`.
-
-## Project structure
-```text
-backend/
-  app/
-    main.py        # FastAPI routes
-    models.py      # Request/response models
-    scheduler.py   # Gemini + heuristic schedule engine
-    storage.py     # JSON persistence
-    ai_client.py   # Gemini wrapper
-    config.py
-  data/
-  requirements.txt
-  .env.example
-frontend/
-  src/
-    App.tsx        # MVP single-page UI
-    api.ts         # Backend API client
-    types.ts       # Shared frontend types
-    styles.css
-  package.json
-  .env.example
-```
-
-## Frontend MVP
-Tech stack: `React + TypeScript + Vite`.
-
-What the frontend supports:
-1. Configure `backend URL` and `user ID`.
-2. Add/delete tasks and sync task JSON to backend.
-3. Save user energy description text.
-4. Add/remove current calendar events and sync to backend.
-5. Chatbot with emotion detection and delta confirmation workflow.
-6. Generate schedule JSON and render results.
-7. Submit and view periodic user check-ins.
-
-### Run frontend
-From repo root:
-
+## Run Frontend
 ```bash
 cd frontend
 cp .env.example .env
@@ -252,11 +182,8 @@ npm install
 npm run dev
 ```
 
-Open frontend at:
-- `http://localhost:5173`
+## Environment Variables
+- `GEMINI_API_KEY`: optional, used for chat/energy-language parsing
+- `GEMINI_MODEL`: optional, default `gemini-1.5-flash`
+- `DATA_STORE_PATH`: optional JSON storage path
 
-By default it calls backend at:
-- `http://localhost:8000`
-
-If your backend uses a different URL, update it in the UI Connection panel or set:
-- `VITE_API_BASE_URL` in `frontend/.env`

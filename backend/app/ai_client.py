@@ -70,15 +70,67 @@ class GeminiSchedulerClient:
             '    "calendar_add": [{"id":"str","title":"str","start":"ISO-8601","end":"ISO-8601"}],\n'
             '    "calendar_ids_remove": ["str"],\n'
             '    "calendar_title_contains_remove": ["str"],\n'
-            '    "energy_profile_append": "string or null",\n'
-            '    "energy_profile_replace": "string or null"\n'
+            '    "energy_intervals_add": [{"id":"str","start_time":"HH:MM","end_time":"HH:MM","energy_level":-3,"hard_block":false,"label":"str or null","notes":"str or null","recurrence":{"type":"daily|weekly|specific_date|date_range|monthly_nth_weekday|monthly_weekdays","days_of_week":[0],"week_of_month":1,"weekday":0,"date":"YYYY-MM-DD","start_date":"YYYY-MM-DD","end_date":"YYYY-MM-DD"}}],\n'
+            '    "energy_interval_ids_remove": ["str"],\n'
+            '    "energy_clear_all": false,\n'
+            '    "energy_notes_append": "string or null"\n'
             "  }\n"
             "}\n"
             "Guidance:\n"
             "- Detect emotions from the chat text.\n"
             "- If user asks for task/calendar changes, include only intended changes.\n"
-            "- If user only shares mood/energy, set energy_profile_append with a concise note.\n"
+            "- If user shares mood/energy constraints, convert them into energy_intervals_add.\n"
+            "- Use hard_block true when user says they are unavailable, busy, in exam/class, or cannot work.\n"
             "- Do not include markdown.\n\n"
+            f"Input JSON:\n{json.dumps(payload, indent=2, default=str)}"
+        )
+
+        try:
+            response = self._model.generate_content(prompt)
+            content = getattr(response, "text", None)
+            if not content:
+                return None
+            return self._extract_json(content)
+        except Exception:
+            return None
+
+    def extract_energy_profile_intervals(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        if not self._model:
+            return None
+
+        prompt = (
+            "Convert this user energy description into structured energy intervals.\n"
+            "Return strict JSON only with schema:\n"
+            "{\n"
+            '  "intervals": [\n'
+            '    {\n'
+            '      "id": "str",\n'
+            '      "start_time": "HH:MM",\n'
+            '      "end_time": "HH:MM",\n'
+            '      "energy_level": -5 to 5,\n'
+            '      "hard_block": true/false,\n'
+            '      "label": "str or null",\n'
+            '      "notes": "str or null",\n'
+            '      "recurrence": {\n'
+            '        "type": "daily|weekly|specific_date|date_range|monthly_nth_weekday|monthly_weekdays",\n'
+            '        "days_of_week": [0],\n'
+            '        "week_of_month": 1,\n'
+            '        "weekday": 0,\n'
+            '        "date": "YYYY-MM-DD",\n'
+            '        "start_date": "YYYY-MM-DD",\n'
+            '        "end_date": "YYYY-MM-DD"\n'
+            "      }\n"
+            "    }\n"
+            "  ],\n"
+            '  "notes_append": "string or null"\n'
+            "}\n"
+            "Mapping guidance:\n"
+            "- Positive productivity windows -> positive energy_level (2 to 5).\n"
+            "- Tired/slump windows -> negative energy_level (-2 to -4).\n"
+            "- Unavailable/busy/exam windows -> energy_level -5 and hard_block true.\n"
+            "- For phrases like '3rd week of every month', use monthly_weekdays with week_of_month=3.\n"
+            "- For next-week/day-specific references, use specific_date.\n"
+            "- No markdown.\n\n"
             f"Input JSON:\n{json.dumps(payload, indent=2, default=str)}"
         )
 

@@ -50,7 +50,12 @@ export class ApiClient {
   async updateEnergyProfile(userId: string, description: string): Promise<MessageResponse> {
     return this.request<MessageResponse>("/api/v1/energy-profile", {
       method: "POST",
-      body: { user_id: userId, description }
+      body: {
+        user_id: userId,
+        description,
+        mode: "merge",
+        use_ai: true
+      }
     });
   }
 
@@ -119,8 +124,16 @@ export class ApiClient {
     });
   }
 
-  async health(): Promise<{ status: string; ai_provider: string }> {
-    return this.request<{ status: string; ai_provider: string }>("/health");
+  async health(): Promise<{
+    status: string;
+    chat_ai_provider: string;
+    scheduler_strategy: string;
+  }> {
+    return this.request<{
+      status: string;
+      chat_ai_provider: string;
+      scheduler_strategy: string;
+    }>("/health");
   }
 
   private async request<T>(path: string, options: RequestOptions = {}): Promise<T> {

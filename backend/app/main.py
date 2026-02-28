@@ -12,6 +12,11 @@ except ImportError:  # pragma: no cover - optional dependency at runtime.
 from .ai_client import GeminiSchedulerClient
 from .chatbot import analyze_chat_message, build_delta_preview
 from .config import get_settings
+from .energy_profile import (
+    coerce_energy_profile,
+    merge_energy_profile,
+    parse_description_to_intervals,
+)
 from .models import (
     CalendarEvent,
     CalendarSyncRequest,
@@ -22,6 +27,7 @@ from .models import (
     ChatDelta,
     CheckinRecord,
     CheckinRequest,
+    EnergyProfile,
     EnergyProfileUpdateRequest,
     MessageResponse,
     ScheduleGenerateRequest,
@@ -38,7 +44,7 @@ settings = get_settings()
 store = JsonStore(settings.data_file)
 gemini_client = GeminiSchedulerClient(settings.gemini_api_key, settings.gemini_model)
 
-app = FastAPI(title=settings.app_name, version="0.1.0")
+app = FastAPI(title=settings.app_name, version="0.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -52,7 +58,8 @@ app.add_middleware(
 def health() -> dict[str, str]:
     return {
         "status": "ok",
-        "ai_provider": "gemini" if gemini_client.enabled else "heuristic-only",
+        "chat_ai_provider": "gemini" if gemini_client.enabled else "heuristic-fallback",
+        "scheduler_strategy": "heuristic-only",
     }
 
 
@@ -85,7 +92,58 @@ def delete_task(task_id: str, user_id: str = Query(...)) -> MessageResponse:
 
 @app.post("/api/v1/energy-profile", response_model=MessageResponse)
 def update_energy_profile(payload: EnergyProfileUpdateRequest) -> MessageResponse:
-    store.update_energy_profile(payload.user_id, payload.description)
+    current_state = store.get_user_state(payload.user_id)
+    base_profile = coerce_energy_profile(
+        current_state.get("energy_profile"),
+        timezone_name=payload.timezone or "UTC",
+    )
+
+    next_profile: EnergyProfile
+    if payload.profile is not None and payload.mode == "replace":
+        next_profile = payload.profile
+    else:
+        intervals_add = []
+        notes_append: str | None = None
+        if payload.profile is not None:
+            intervals_add.extend(payload.profile.intervals)
+            if payload.profile.freeform_notes:
+                notes_append = payload.profile.freeform_notes
+        if payload.description:
+            parsed_intervals, parsed_notes = parse_description_to_intervals(
+                description=payload.description,
+                timezone_name=payload.timezone or base_profile.timezone,
+                use_ai=payload.use_ai,
+                gemini_client=gemini_client,
+            )
+            intervals_add.extend(parsed_intervals)
+            if parsed_notes:
+                notes_append = f"{notes_append}\n{parsed_notes}".strip() if notes_append else parsed_notes
+            elif payload.description.strip():
+                notes_append = (
+                    f"{notes_append}\n{payload.description.strip()}".strip()
+                    if notes_append
+                    else payload.description.strip()
+                )
+
+        if payload.mode == "replace":
+            replacement = EnergyProfile(
+                timezone=payload.timezone or base_profile.timezone,
+                intervals=intervals_add,
+                freeform_notes=notes_append,
+            )
+            next_profile = merge_energy_profile(
+                base_profile=base_profile,
+                intervals_add=[],
+                replace_profile=replacement,
+            )
+        else:
+            next_profile = merge_energy_profile(
+                base_profile=base_profile,
+                intervals_add=intervals_add,
+                notes_append=notes_append,
+            )
+
+    store.update_energy_profile(payload.user_id, next_profile.model_dump(mode="json"))
     return MessageResponse(message="Energy profile updated")
 
 
@@ -112,19 +170,31 @@ def analyze_chat(payload: ChatAnalyzeRequest) -> ChatAnalyzeResponse:
         gemini_client=gemini_client,
     )
 
-    energy_delta = ChatDelta(
-        energy_profile_append=response.proposed_delta.energy_profile_append,
-        energy_profile_replace=response.proposed_delta.energy_profile_replace,
+    energy_only_delta = ChatDelta(
+        energy_intervals_add=response.proposed_delta.energy_intervals_add,
+        energy_interval_ids_remove=response.proposed_delta.energy_interval_ids_remove,
+        energy_clear_all=response.proposed_delta.energy_clear_all,
+        energy_notes_append=response.proposed_delta.energy_notes_append,
     )
-    if energy_delta.energy_profile_append or energy_delta.energy_profile_replace:
+
+    if (
+        energy_only_delta.energy_intervals_add
+        or energy_only_delta.energy_interval_ids_remove
+        or energy_only_delta.energy_clear_all
+        or energy_only_delta.energy_notes_append
+    ):
         updated_state = store.apply_chat_delta(
             payload.user_id,
-            energy_delta.model_dump(mode="json"),
-            apply_energy_update=True,
+            energy_only_delta.model_dump(mode="json"),
         )
-        response.updated_energy_profile = updated_state.get("energy_profile")
-        response.proposed_delta.energy_profile_append = None
-        response.proposed_delta.energy_profile_replace = None
+        response.updated_energy_profile = coerce_energy_profile(
+            updated_state.get("energy_profile"),
+            timezone_name=payload.timezone,
+        )
+        response.proposed_delta.energy_intervals_add = []
+        response.proposed_delta.energy_interval_ids_remove = []
+        response.proposed_delta.energy_clear_all = False
+        response.proposed_delta.energy_notes_append = None
         response.delta_preview = build_delta_preview(response.proposed_delta)
         response.requires_confirmation = response.proposed_delta.requires_confirmation()
 
@@ -135,16 +205,20 @@ def analyze_chat(payload: ChatAnalyzeRequest) -> ChatAnalyzeResponse:
 def apply_chat_delta(payload: ChatApplyRequest) -> ChatApplyResponse:
     has_any_changes = bool(
         payload.delta.requires_confirmation()
-        or payload.delta.energy_profile_append
-        or payload.delta.energy_profile_replace
+        or payload.delta.energy_intervals_add
+        or payload.delta.energy_interval_ids_remove
+        or payload.delta.energy_clear_all
+        or payload.delta.energy_notes_append
     )
     if not has_any_changes:
-        return ChatApplyResponse(message="No delta changes to apply.", user_state=_hydrate_state(payload.user_id))
+        return ChatApplyResponse(
+            message="No delta changes to apply.",
+            user_state=_hydrate_state(payload.user_id),
+        )
 
     store.apply_chat_delta(
         payload.user_id,
         payload.delta.model_dump(mode="json"),
-        apply_energy_update=True,
     )
     return ChatApplyResponse(
         message="Delta applied successfully.",
@@ -159,11 +233,14 @@ def generate_schedule(payload: ScheduleGenerateRequest) -> ScheduleGenerateRespo
     stored_calendar_events = [
         CalendarEvent.model_validate(event) for event in current_state.get("calendar_events", [])
     ]
+    energy_profile = coerce_energy_profile(
+        current_state.get("energy_profile"),
+        timezone_name=payload.timezone,
+    )
 
     merged_tasks: dict[str, Task] = {task.id: task for task in stored_tasks}
     for task in payload.new_tasks:
         merged_tasks[task.id] = task
-
     final_tasks = list(merged_tasks.values())
     if payload.new_tasks:
         store.sync_tasks(payload.user_id, [task.model_dump(mode="json") for task in final_tasks])
@@ -175,16 +252,40 @@ def generate_schedule(payload: ScheduleGenerateRequest) -> ScheduleGenerateRespo
             [event.model_dump(mode="json") for event in payload.current_calendar],
         )
 
-    energy_description = payload.user_description or current_state.get("energy_profile")
+    if not energy_profile.intervals and (energy_profile.freeform_notes or "").strip():
+        inferred_intervals, _ = parse_description_to_intervals(
+            description=energy_profile.freeform_notes or "",
+            timezone_name=payload.timezone,
+            use_ai=False,
+            gemini_client=gemini_client,
+        )
+        if inferred_intervals:
+            energy_profile = merge_energy_profile(
+                base_profile=energy_profile,
+                intervals_add=inferred_intervals,
+            )
+            store.update_energy_profile(payload.user_id, energy_profile.model_dump(mode="json"))
+
     if payload.user_description:
-        store.update_energy_profile(payload.user_id, payload.user_description)
+        parsed_intervals, parsed_notes = parse_description_to_intervals(
+            description=payload.user_description,
+            timezone_name=payload.timezone,
+            use_ai=payload.use_ai,
+            gemini_client=gemini_client,
+        )
+        merged_profile = merge_energy_profile(
+            base_profile=energy_profile,
+            intervals_add=parsed_intervals,
+            notes_append=parsed_notes or payload.user_description.strip(),
+        )
+        store.update_energy_profile(payload.user_id, merged_profile.model_dump(mode="json"))
+        energy_profile = merged_profile
 
     effective_payload = payload.model_copy(update={"current_calendar": final_calendar_events})
     return build_schedule(
         request=effective_payload,
         tasks=final_tasks,
-        energy_description=energy_description,
-        gemini_client=gemini_client,
+        energy_profile=energy_profile,
     )
 
 
@@ -193,9 +294,7 @@ def _hydrate_state(user_id: str) -> UserStateResponse:
     return UserStateResponse(
         user_id=user_id,
         tasks=[Task.model_validate(task) for task in state.get("tasks", [])],
-        calendar_events=[
-            CalendarEvent.model_validate(event) for event in state.get("calendar_events", [])
-        ],
-        energy_profile=state.get("energy_profile"),
+        calendar_events=[CalendarEvent.model_validate(event) for event in state.get("calendar_events", [])],
+        energy_profile=coerce_energy_profile(state.get("energy_profile")),
         checkins=[CheckinRecord.model_validate(checkin) for checkin in state.get("checkins", [])],
     )

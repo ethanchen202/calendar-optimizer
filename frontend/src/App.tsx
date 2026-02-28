@@ -5,6 +5,7 @@ import type {
   CalendarEvent,
   ChatDelta,
   CheckinRecord,
+  EnergyProfile,
   ScheduleResponse,
   Task,
   UserState
@@ -17,6 +18,14 @@ type ChatTurn = {
   role: "user" | "assistant";
   text: string;
   timestamp: string;
+};
+
+const EMPTY_PROFILE: EnergyProfile = {
+  version: 1,
+  timezone: DEFAULT_TIMEZONE,
+  intervals: [],
+  freeform_notes: null,
+  updated_at: null
 };
 
 function App() {
@@ -32,7 +41,8 @@ function App() {
   const [errorMessage, setErrorMessage] = useState<string>("");
 
   const [tasks, setTasks] = useState<Task[]>([]);
-  const [energyProfile, setEnergyProfile] = useState<string>("");
+  const [energyProfile, setEnergyProfile] = useState<EnergyProfile>(EMPTY_PROFILE);
+  const [energyProfileInputText, setEnergyProfileInputText] = useState("");
   const [checkins, setCheckins] = useState<CheckinRecord[]>([]);
   const [calendarEvents, setCalendarEvents] = useState<CalendarEvent[]>([]);
   const [schedule, setSchedule] = useState<ScheduleResponse | null>(null);
@@ -49,7 +59,6 @@ function App() {
   const [eventStart, setEventStart] = useState("");
   const [eventEnd, setEventEnd] = useState("");
 
-  const [scheduleDescription, setScheduleDescription] = useState("");
   const [planningHorizonDays, setPlanningHorizonDays] = useState("7");
   const [timezone, setTimezone] = useState(DEFAULT_TIMEZONE);
   const [useAI, setUseAI] = useState(true);
@@ -102,11 +111,7 @@ function App() {
   function applyUserState(state: UserState) {
     setTasks(state.tasks);
     setCalendarEvents(state.calendar_events ?? []);
-    const profile = state.energy_profile ?? "";
-    setEnergyProfile(profile);
-    if (!scheduleDescription.trim()) {
-      setScheduleDescription(profile);
-    }
+    setEnergyProfile(state.energy_profile ?? EMPTY_PROFILE);
     setCheckins(state.checkins);
   }
 
@@ -124,7 +129,9 @@ function App() {
   async function checkBackendHealth() {
     try {
       const health = await api.health();
-      setBackendHealth(`${health.status} (${health.ai_provider})`);
+      setBackendHealth(
+        `${health.status} | chat: ${health.chat_ai_provider} | scheduler: ${health.scheduler_strategy}`
+      );
     } catch {
       setBackendHealth("offline");
     }
@@ -246,11 +253,14 @@ function App() {
       clearMessages();
       setIsSavingEnergy(true);
       const uid = requireUserId();
-      await api.updateEnergyProfile(uid, energyProfile);
-      setStatusMessage("Energy profile saved.");
-      if (!scheduleDescription.trim()) {
-        setScheduleDescription(energyProfile);
+      const description = energyProfileInputText.trim();
+      if (!description) {
+        throw new Error("Energy profile text update is required.");
       }
+      await api.updateEnergyProfile(uid, description);
+      setEnergyProfileInputText("");
+      await loadUserState();
+      setStatusMessage("Energy profile updated and parsed into intervals.");
     } catch (error) {
       setErrorMessage(getErrorMessage(error));
     } finally {
@@ -284,7 +294,6 @@ function App() {
           end: endDate.toISOString()
         }
       ];
-
       await saveCalendar(nextEvents, "Added and synced current calendar event.");
       setEventTitle("");
       setEventStart("");
@@ -308,7 +317,6 @@ function App() {
       clearMessages();
       setIsGeneratingSchedule(true);
       const uid = requireUserId();
-
       const horizon = Number.parseInt(planningHorizonDays, 10);
       if (Number.isNaN(horizon) || horizon < 1 || horizon > 30) {
         throw new Error("Planning horizon must be between 1 and 30 days.");
@@ -318,13 +326,13 @@ function App() {
         userId: uid,
         currentCalendar: calendarEvents,
         newTasks: tasks,
-        userDescription: scheduleDescription || energyProfile,
+        userDescription: "",
         planningHorizonDays: horizon,
         timezone: timezone.trim() || "UTC",
-        useAI
+        useAI: false
       });
       setSchedule(response);
-      setStatusMessage(`Schedule generated with ${response.strategy_used} strategy.`);
+      setStatusMessage("Schedule generated with deterministic heuristic strategy.");
     } catch (error) {
       setErrorMessage(getErrorMessage(error));
     } finally {
@@ -342,10 +350,7 @@ function App() {
       if (!feedback) {
         throw new Error("Check-in feedback is required.");
       }
-
-      const satisfaction = checkinSatisfaction
-        ? Number.parseInt(checkinSatisfaction, 10)
-        : undefined;
+      const satisfaction = checkinSatisfaction ? Number.parseInt(checkinSatisfaction, 10) : undefined;
       await api.submitCheckin({ userId: uid, feedback, satisfaction });
       setCheckinFeedback("");
       setCheckinSatisfaction("");
@@ -368,7 +373,6 @@ function App() {
       if (!message) {
         throw new Error("Chat message cannot be empty.");
       }
-
       pushChatTurn("user", message);
       setChatInput("");
 
@@ -381,12 +385,8 @@ function App() {
 
       pushChatTurn("assistant", response.assistant_message);
       setChatEmotions(response.detected_emotions);
-
-      if (response.updated_energy_profile !== null && response.updated_energy_profile !== undefined) {
+      if (response.updated_energy_profile) {
         setEnergyProfile(response.updated_energy_profile);
-        if (!scheduleDescription.trim()) {
-          setScheduleDescription(response.updated_energy_profile);
-        }
       }
 
       if (response.requires_confirmation && hasStructuralDeltaChanges(response.proposed_delta)) {
@@ -396,7 +396,7 @@ function App() {
       } else {
         setPendingChatDelta(null);
         setPendingDeltaPreview([]);
-        setStatusMessage("Chat analyzed. No confirmation-required changes pending.");
+        setStatusMessage("Chat analyzed and energy profile updated.");
       }
     } catch (error) {
       setErrorMessage(getErrorMessage(error));
@@ -435,11 +435,11 @@ function App() {
   return (
     <div className="app-shell">
       <header className="hero">
-        <p className="kicker">Calendar Optimizer MVP</p>
-        <h1>Design your schedule around your energy, not just your to-do list.</h1>
+        <p className="kicker">Calendar Optimizer</p>
+        <h1>Energy-aware planning with structured profile intervals.</h1>
         <p>
-          Tasks, current calendar, energy profile, and check-ins are persisted in your FastAPI
-          backend. The chatbot can propose deltas and requires explicit confirmation.
+          The scheduler now uses only deterministic heuristics over tasks, calendar constraints, and
+          the structured energy profile JSON.
         </p>
       </header>
 
@@ -479,14 +479,10 @@ function App() {
       <section className="panel">
         <h2>Chatbot</h2>
         <p className="muted">
-          Ask naturally (examples: "I am exhausted today", "add task finish ML homework for 90
-          minutes", "remove task play clash", "add event | Deep Work | 2026-03-01 16:00 |
-          2026-03-01 18:00").
+          Use chat for mood updates and task/calendar edits. Structural changes show a confirmation
+          delta before applying.
         </p>
-
-        {chatEmotions.length > 0 ? (
-          <p className="muted">Detected emotions: {chatEmotions.join(", ")}</p>
-        ) : null}
+        {chatEmotions.length > 0 ? <p className="muted">Detected emotions: {chatEmotions.join(", ")}</p> : null}
 
         <div className="chat-log">
           {chatTurns.length === 0 ? (
@@ -508,8 +504,12 @@ function App() {
               value={chatInput}
               onChange={(event) => setChatInput(event.target.value)}
               rows={3}
-              placeholder="Tell the assistant how you feel or what to change."
+              placeholder="e.g. I have a test next Monday from 2-4 pm and I will be too tired the rest of the day."
             />
+          </label>
+          <label className="check-label">
+            <input type="checkbox" checked={useAI} onChange={(event) => setUseAI(event.target.checked)} />
+            Use Gemini for language understanding
           </label>
           <button type="submit" disabled={isAnalyzingChat}>
             {isAnalyzingChat ? "Analyzing..." : "Send to Chatbot"}
@@ -649,18 +649,40 @@ function App() {
           <h2>Energy Profile</h2>
           <form onSubmit={handleSaveEnergyProfile} className="stack">
             <label>
-              Typical daily energy notes
+              Energy profile update text
               <textarea
-                value={energyProfile}
-                onChange={(event) => setEnergyProfile(event.target.value)}
-                rows={6}
-                placeholder="I feel focused from 4-8 pm and tired from 1-3 pm..."
+                value={energyProfileInputText}
+                onChange={(event) => setEnergyProfileInputText(event.target.value)}
+                rows={5}
+                placeholder="e.g. I am unusually busy on the 3rd week of every month."
               />
             </label>
             <button type="submit" disabled={isSavingEnergy}>
-              {isSavingEnergy ? "Saving..." : "Save Energy Profile"}
+              {isSavingEnergy ? "Saving..." : "Parse + Merge Into Profile"}
             </button>
           </form>
+          <h3>Parsed Intervals ({energyProfile.intervals.length})</h3>
+          <ul className="list compact">
+            {energyProfile.intervals.length === 0 ? (
+              <li>No intervals yet.</li>
+            ) : (
+              energyProfile.intervals.map((interval) => (
+                <li key={interval.id}>
+                  <div>
+                    <strong>{interval.label ?? interval.id}</strong>
+                    <p>
+                      {interval.start_time} - {interval.end_time} | level {interval.energy_level} | recurrence{" "}
+                      {interval.recurrence.type}
+                    </p>
+                  </div>
+                </li>
+              ))
+            )}
+          </ul>
+          <details>
+            <summary>View Energy Profile JSON</summary>
+            <pre className="json-preview">{JSON.stringify(energyProfile, null, 2)}</pre>
+          </details>
         </section>
       </div>
 
@@ -740,19 +762,7 @@ function App() {
                 />
               </label>
             </div>
-            <label className="check-label">
-              <input type="checkbox" checked={useAI} onChange={(event) => setUseAI(event.target.checked)} />
-              Use Gemini (falls back to heuristic automatically)
-            </label>
-            <label>
-              Description used for scheduling
-              <textarea
-                value={scheduleDescription}
-                onChange={(event) => setScheduleDescription(event.target.value)}
-                rows={4}
-                placeholder="Optional override; defaults to saved energy profile."
-              />
-            </label>
+            <p className="muted">Scheduler is deterministic heuristic mode (no AI scheduling).</p>
             <button type="submit" disabled={isGeneratingSchedule}>
               {isGeneratingSchedule ? "Generating..." : "Generate Schedule"}
             </button>

@@ -20,6 +20,41 @@ export type CalendarEvent = {
   end: string;
 };
 
+export type EnergyRecurrence = {
+  type:
+    | "daily"
+    | "weekly"
+    | "specific_date"
+    | "date_range"
+    | "monthly_nth_weekday"
+    | "monthly_weekdays";
+  days_of_week?: number[];
+  week_of_month?: number | null;
+  weekday?: number | null;
+  date?: string | null;
+  start_date?: string | null;
+  end_date?: string | null;
+};
+
+export type EnergyInterval = {
+  id: string;
+  start_time: string;
+  end_time: string;
+  energy_level: number;
+  hard_block: boolean;
+  label?: string | null;
+  notes?: string | null;
+  recurrence: EnergyRecurrence;
+};
+
+export type EnergyProfile = {
+  version: number;
+  timezone: string;
+  intervals: EnergyInterval[];
+  freeform_notes?: string | null;
+  updated_at?: string | null;
+};
+
 export type CheckinRecord = {
   feedback: string;
   satisfaction?: number | null;
@@ -30,7 +65,7 @@ export type UserState = {
   user_id: string;
   tasks: Task[];
   calendar_events: CalendarEvent[];
-  energy_profile?: string | null;
+  energy_profile: EnergyProfile;
   checkins: CheckinRecord[];
 };
 
@@ -40,7 +75,7 @@ export type ScheduledEvent = {
   task_id: string;
   start: string;
   end: string;
-  source: "gemini" | "heuristic";
+  source: "heuristic";
 };
 
 export type UnscheduledTask = {
@@ -51,7 +86,7 @@ export type UnscheduledTask = {
 export type ScheduleResponse = {
   user_id: string;
   generated_at: string;
-  strategy_used: "gemini" | "heuristic";
+  strategy_used: "heuristic";
   schedule_events: ScheduledEvent[];
   unscheduled_tasks: UnscheduledTask[];
 };
@@ -67,8 +102,10 @@ export type ChatDelta = {
   calendar_add: CalendarEvent[];
   calendar_ids_remove: string[];
   calendar_title_contains_remove: string[];
-  energy_profile_append?: string | null;
-  energy_profile_replace?: string | null;
+  energy_intervals_add: EnergyInterval[];
+  energy_interval_ids_remove: string[];
+  energy_clear_all: boolean;
+  energy_notes_append?: string | null;
 };
 
 export type ChatAnalyzeResponse = {
@@ -78,10 +115,11 @@ export type ChatAnalyzeResponse = {
   proposed_delta: ChatDelta;
   requires_confirmation: boolean;
   delta_preview: string[];
-  updated_energy_profile?: string | null;
+  updated_energy_profile?: EnergyProfile | null;
 };
 
 export type ChatApplyResponse = {
   message: string;
   user_state: UserState;
 };
+

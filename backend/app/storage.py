@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .energy_profile import default_energy_profile
+
 
 class JsonStore:
     def __init__(self, file_path: Path) -> None:
@@ -16,10 +18,28 @@ class JsonStore:
     def _default_state(self) -> dict[str, Any]:
         return {"users": {}}
 
+    def _default_energy_profile_payload(self, timezone_name: str = "UTC") -> dict[str, Any]:
+        return default_energy_profile(timezone_name=timezone_name).model_dump(mode="json")
+
+    def _normalize_energy_profile(self, value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            if "intervals" in value and isinstance(value["intervals"], list):
+                if "version" not in value:
+                    value["version"] = 1
+                if "timezone" not in value:
+                    value["timezone"] = "UTC"
+                if "updated_at" not in value:
+                    value["updated_at"] = datetime.now(timezone.utc).isoformat()
+                return value
+        if isinstance(value, str):
+            profile = self._default_energy_profile_payload("UTC")
+            profile["freeform_notes"] = value
+            return profile
+        return self._default_energy_profile_payload("UTC")
+
     def _read_state(self) -> dict[str, Any]:
         if not self._file_path.exists():
             return self._default_state()
-
         try:
             return json.loads(self._file_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
@@ -35,7 +55,7 @@ class JsonStore:
         user_state = users.setdefault(user_id, {})
         user_state.setdefault("tasks", [])
         user_state.setdefault("calendar_events", [])
-        user_state.setdefault("energy_profile", None)
+        user_state["energy_profile"] = self._normalize_energy_profile(user_state.get("energy_profile"))
         user_state.setdefault("checkins", [])
         return user_state
 
@@ -43,6 +63,7 @@ class JsonStore:
         with self._lock:
             state = self._read_state()
             user_state = self._ensure_user(state, user_id)
+            self._write_state(state)
             return {
                 "tasks": user_state["tasks"],
                 "calendar_events": user_state["calendar_events"],
@@ -75,11 +96,12 @@ class JsonStore:
             user_state["calendar_events"] = events
             self._write_state(state)
 
-    def update_energy_profile(self, user_id: str, description: str) -> None:
+    def update_energy_profile(self, user_id: str, profile: dict[str, Any]) -> None:
         with self._lock:
             state = self._read_state()
             user_state = self._ensure_user(state, user_id)
-            user_state["energy_profile"] = description
+            user_state["energy_profile"] = self._normalize_energy_profile(profile)
+            user_state["energy_profile"]["updated_at"] = datetime.now(timezone.utc).isoformat()
             self._write_state(state)
 
     def add_checkin(
@@ -106,7 +128,6 @@ class JsonStore:
         self,
         user_id: str,
         delta: dict[str, Any],
-        apply_energy_update: bool = True,
     ) -> dict[str, Any]:
         with self._lock:
             state = self._read_state()
@@ -173,17 +194,39 @@ class JsonStore:
                 )
             ]
 
-            if apply_energy_update:
-                if delta.get("energy_profile_replace"):
-                    user_state["energy_profile"] = str(delta["energy_profile_replace"]).strip()
-                elif delta.get("energy_profile_append"):
-                    note = str(delta["energy_profile_append"]).strip()
-                    if note:
-                        existing = str(user_state.get("energy_profile") or "").strip()
-                        if existing:
-                            user_state["energy_profile"] = f"{existing}\n{note}"
-                        else:
-                            user_state["energy_profile"] = note
+            energy_profile = self._normalize_energy_profile(user_state.get("energy_profile"))
+            if delta.get("energy_clear_all"):
+                energy_profile["intervals"] = []
+
+            existing_intervals = {
+                str(interval.get("id", "")).strip(): interval
+                for interval in energy_profile.get("intervals", [])
+                if str(interval.get("id", "")).strip()
+            }
+            remove_energy_ids = {
+                str(interval_id).strip()
+                for interval_id in delta.get("energy_interval_ids_remove", [])
+                if str(interval_id).strip()
+            }
+            for remove_id in remove_energy_ids:
+                existing_intervals.pop(remove_id, None)
+
+            for interval in delta.get("energy_intervals_add", []):
+                interval_id = str(interval.get("id", "")).strip()
+                if interval_id:
+                    existing_intervals[interval_id] = interval
+
+            energy_profile["intervals"] = list(existing_intervals.values())
+
+            note = str(delta.get("energy_notes_append") or "").strip()
+            if note:
+                existing_notes = str(energy_profile.get("freeform_notes") or "").strip()
+                energy_profile["freeform_notes"] = (
+                    f"{existing_notes}\n{note}" if existing_notes else note
+                )
+
+            energy_profile["updated_at"] = datetime.now(timezone.utc).isoformat()
+            user_state["energy_profile"] = energy_profile
 
             self._write_state(state)
             return {
@@ -192,3 +235,4 @@ class JsonStore:
                 "energy_profile": user_state["energy_profile"],
                 "checkins": user_state["checkins"],
             }
+
