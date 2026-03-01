@@ -5,7 +5,7 @@ Calendar optimization app with a deterministic heuristic scheduler and structure
 1. Energy profile is now structured JSON, not a single long text string.
 2. Chatbot and energy text updates both map into the same interval-based energy profile.
 3. Scheduling is heuristic-only (no AI scheduling path).
-4. Chat still uses Gemini (optional) for language understanding.
+4. Chat/energy parsing can use either Gemini or Modal vLLM via `AI_PROVIDER`.
 
 ## Energy Profile JSON Design
 Each user has an `energy_profile` object:
@@ -174,6 +174,32 @@ cp .env.example .env
 uvicorn app.main:app --reload --port 8000
 ```
 
+## Deploy Modal vLLM (Python 3.11.x)
+Use this when `AI_PROVIDER=modal`.
+
+```bash
+cd backend
+source .venv/bin/activate
+pip install -U "modal>=1.0.0,<2.0.0"
+modal setup
+modal deploy modal_vllm_inference.py
+```
+
+After deploy, copy the printed URL (for example `https://<workspace>--<app>-serve.modal.run`) and set:
+
+```bash
+AI_PROVIDER=modal
+MODAL_VLLM_ENDPOINT=https://<workspace>--<app>-serve.modal.run
+MODAL_VLLM_MODEL=Qwen/Qwen2.5-7B-Instruct
+MODAL_VLLM_API_KEY=
+```
+
+Optional smoke test from your local machine:
+
+```bash
+modal run modal_vllm_inference.py --prompt "Say hello in one sentence."
+```
+
 ## Run Frontend
 ```bash
 cd frontend
@@ -183,7 +209,11 @@ npm run dev
 ```
 
 ## Environment Variables
-- `GEMINI_API_KEY`: optional, used for chat/energy-language parsing
+- `AI_PROVIDER`: `gemini` (default) or `modal`
+- `GEMINI_API_KEY`: optional, used when `AI_PROVIDER=gemini`
 - `GEMINI_MODEL`: optional, default `gemini-1.5-flash`
+- `MODAL_VLLM_ENDPOINT`: Modal web URL for deployed `serve` function (base URL, no `/v1/chat/completions`)
+- `MODAL_VLLM_MODEL`: must match the model served by Modal (default `Qwen/Qwen2.5-7B-Instruct`)
+- `MODAL_VLLM_API_KEY`: optional bearer token if vLLM is started with `--api-key`
+- `MODAL_VLLM_TIMEOUT_SECONDS`: HTTP timeout for backend->Modal inference calls
 - `DATA_STORE_PATH`: optional JSON storage path
-

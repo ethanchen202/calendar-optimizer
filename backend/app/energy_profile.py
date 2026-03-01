@@ -4,7 +4,7 @@ import re
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 
-from .ai_client import GeminiSchedulerClient
+from .ai_client import SchedulerAIClient
 from .models import EnergyInterval, EnergyProfile, EnergyRecurrence
 
 DAY_NAME_TO_INDEX = {
@@ -95,15 +95,15 @@ def parse_description_to_intervals(
     description: str,
     timezone_name: str,
     use_ai: bool,
-    gemini_client: GeminiSchedulerClient,
+    ai_client: SchedulerAIClient,
     reference_now: datetime | None = None,
 ) -> tuple[list[EnergyInterval], str | None]:
     text = description.strip()
     if not text:
         return [], None
 
-    if use_ai and gemini_client.enabled:
-        ai_result = gemini_client.extract_energy_profile_intervals(
+    if use_ai and ai_client.enabled:
+        ai_result = ai_client.extract_energy_profile_intervals(
             {
                 "description": text,
                 "timezone": timezone_name,
@@ -328,4 +328,3 @@ def _time_to_minutes(value: str) -> int:
     if len(parts) != 2:
         raise ValueError("Invalid time format")
     return int(parts[0]) * 60 + int(parts[1])
-

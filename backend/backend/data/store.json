@@ -1,0 +1,96 @@
+{
+  "users": {
+    "user_123": {
+      "tasks": [],
+      "calendar_events": [
+        {
+          "id": "event_1772360000",
+          "title": "Meeting",
+          "start": "2026-03-02T16:00:00-06:00",
+          "end": "2026-03-02T17:00:00-06:00"
+        }
+      ],
+      "energy_profile": {
+        "version": 1,
+        "timezone": "UTC",
+        "intervals": [
+          {
+            "id": "energy_interval_1772351962_1",
+            "start_time": "00:00",
+            "end_time": "23:59",
+            "energy_level": -3,
+            "hard_block": true,
+            "label": "Unavailability",
+            "notes": null,
+            "recurrence": {
+              "type": "date_range",
+              "days_of_week": [],
+              "week_of_month": null,
+              "weekday": null,
+              "date": null,
+              "start_date": "2026-03-01",
+              "end_date": "2026-03-02"
+            }
+          },
+          {
+            "id": "energy_chat_1772358790",
+            "start_time": "03:53",
+            "end_time": "07:53",
+            "energy_level": 0,
+            "hard_block": false,
+            "label": "Mood update",
+            "notes": "Detected emotions: neutral",
+            "recurrence": {
+              "type": "specific_date",
+              "days_of_week": [],
+              "week_of_month": null,
+              "weekday": null,
+              "date": "2026-03-01",
+              "start_date": null,
+              "end_date": null
+            }
+          },
+          {
+            "id": "energy_interval_1772358908_1",
+            "start_time": "11:00",
+            "end_time": "12:00",
+            "energy_level": -5,
+            "hard_block": true,
+            "label": "Unavailable",
+            "notes": null,
+            "recurrence": {
+              "type": "daily",
+              "days_of_week": [],
+              "week_of_month": null,
+              "weekday": null,
+              "date": null,
+              "start_date": null,
+              "end_date": null
+            }
+          },
+          {
+            "id": "energy_chat_1772359062",
+            "start_time": "03:57",
+            "end_time": "07:57",
+            "energy_level": 0,
+            "hard_block": false,
+            "label": "Mood update",
+            "notes": "Detected emotions: neutral",
+            "recurrence": {
+              "type": "specific_date",
+              "days_of_week": [],
+              "week_of_month": null,
+              "weekday": null,
+              "date": "2026-03-01",
+              "start_date": null,
+              "end_date": null
+            }
+          }
+        ],
+        "freeform_notes": null,
+        "updated_at": "2026-03-01T09:58:43.308985+00:00"
+      },
+      "checkins": []
+    }
+  }
+}

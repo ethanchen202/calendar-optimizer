@@ -5,7 +5,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .ai_client import GeminiSchedulerClient
+from .ai_client import SchedulerAIClient
 from .energy_profile import parse_description_to_intervals
 from .models import CalendarEvent, ChatAnalyzeResponse, ChatDelta, EnergyInterval, EnergyRecurrence, Task
 
@@ -36,7 +36,7 @@ def analyze_chat_message(
     timezone_name: str,
     user_state: dict[str, object],
     use_ai: bool,
-    gemini_client: GeminiSchedulerClient,
+    ai_client: SchedulerAIClient,
 ) -> ChatAnalyzeResponse:
     ai_payload = {
         "message": message,
@@ -47,10 +47,10 @@ def analyze_chat_message(
     }
 
     ai_result: dict[str, object] | None = None
-    if use_ai and gemini_client.enabled:
-        ai_result = gemini_client.analyze_chat_delta(ai_payload)
+    if use_ai and ai_client.enabled:
+        ai_result = ai_client.analyze_chat_delta(ai_payload)
 
-    parsed = _coerce_chat_result(message, timezone_name, ai_result, gemini_client, user_state)
+    parsed = _coerce_chat_result(message, timezone_name, ai_result, ai_client, user_state)
     delta = parsed["delta"]
     detected_emotions = parsed["detected_emotions"]
     assistant_message = parsed["assistant_message"]
@@ -71,7 +71,7 @@ def _coerce_chat_result(
     user_message: str,
     timezone_name: str,
     ai_result: dict[str, object] | None,
-    gemini_client: GeminiSchedulerClient,
+    ai_client: SchedulerAIClient,
     user_state: dict[str, object],
 ) -> dict[str, object]:
     ai_assistant_message = ""
@@ -102,7 +102,7 @@ def _coerce_chat_result(
         except Exception:
             logger.exception("Unable to validate AI chat delta. Falling back to heuristic parser.")
 
-    fallback_delta = _fallback_delta(user_message, timezone_name, gemini_client, user_state)
+    fallback_delta = _fallback_delta(user_message, timezone_name, ai_client, user_state)
     fallback_emotions = ai_emotions or _detect_emotions(user_message)
     if not fallback_delta.energy_intervals_add and not fallback_delta.energy_interval_ids_remove:
         fallback_delta.energy_intervals_add = _energy_intervals_from_emotions(
@@ -169,7 +169,7 @@ def _energy_intervals_from_emotions(emotions: list[str], timezone_name: str) -> 
 def _fallback_delta(
     message: str,
     timezone_name: str,
-    gemini_client: GeminiSchedulerClient,
+    ai_client: SchedulerAIClient,
     user_state: dict[str, object],
 ) -> ChatDelta:
     lowered = message.lower()
@@ -246,7 +246,7 @@ def _fallback_delta(
         description=message,
         timezone_name=timezone_name,
         use_ai=False,
-        gemini_client=gemini_client,
+        ai_client=ai_client,
     )
     delta.energy_intervals_add.extend(intervals)
     return delta

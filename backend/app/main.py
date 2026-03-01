@@ -9,7 +9,7 @@ except ImportError:  # pragma: no cover - optional dependency at runtime.
     def load_dotenv() -> bool:
         return False
 
-from .ai_client import GeminiSchedulerClient
+from .ai_client import create_scheduler_ai_client
 from .chatbot import analyze_chat_message, build_delta_preview
 from .config import get_settings
 from .energy_profile import (
@@ -42,7 +42,15 @@ from .storage import JsonStore
 load_dotenv()
 settings = get_settings()
 store = JsonStore(settings.data_file)
-gemini_client = GeminiSchedulerClient(settings.gemini_api_key, settings.gemini_model)
+ai_client = create_scheduler_ai_client(
+    settings.ai_provider,
+    gemini_api_key=settings.gemini_api_key,
+    gemini_model=settings.gemini_model,
+    modal_vllm_endpoint=settings.modal_vllm_endpoint,
+    modal_vllm_api_key=settings.modal_vllm_api_key,
+    modal_vllm_model=settings.modal_vllm_model,
+    modal_vllm_timeout_seconds=settings.modal_vllm_timeout_seconds,
+)
 
 app = FastAPI(title=settings.app_name, version="0.2.0")
 app.add_middleware(
@@ -58,7 +66,8 @@ app.add_middleware(
 def health() -> dict[str, str]:
     return {
         "status": "ok",
-        "chat_ai_provider": "gemini" if gemini_client.enabled else "heuristic-fallback",
+        "chat_ai_provider": ai_client.provider_name if ai_client.enabled else "heuristic-fallback",
+        "chat_ai_configured_provider": settings.ai_provider,
         "scheduler_strategy": "heuristic-only",
     }
 
@@ -113,7 +122,7 @@ def update_energy_profile(payload: EnergyProfileUpdateRequest) -> MessageRespons
                 description=payload.description,
                 timezone_name=payload.timezone or base_profile.timezone,
                 use_ai=payload.use_ai,
-                gemini_client=gemini_client,
+                ai_client=ai_client,
             )
             intervals_add.extend(parsed_intervals)
             if parsed_notes:
@@ -167,7 +176,7 @@ def analyze_chat(payload: ChatAnalyzeRequest) -> ChatAnalyzeResponse:
         timezone_name=payload.timezone,
         user_state=current_state,
         use_ai=payload.use_ai,
-        gemini_client=gemini_client,
+        ai_client=ai_client,
     )
 
     energy_only_delta = ChatDelta(
@@ -257,7 +266,7 @@ def generate_schedule(payload: ScheduleGenerateRequest) -> ScheduleGenerateRespo
             description=energy_profile.freeform_notes or "",
             timezone_name=payload.timezone,
             use_ai=False,
-            gemini_client=gemini_client,
+            ai_client=ai_client,
         )
         if inferred_intervals:
             energy_profile = merge_energy_profile(
@@ -271,7 +280,7 @@ def generate_schedule(payload: ScheduleGenerateRequest) -> ScheduleGenerateRespo
             description=payload.user_description,
             timezone_name=payload.timezone,
             use_ai=payload.use_ai,
-            gemini_client=gemini_client,
+            ai_client=ai_client,
         )
         merged_profile = merge_energy_profile(
             base_profile=energy_profile,
