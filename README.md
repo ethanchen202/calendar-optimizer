@@ -220,3 +220,8 @@ npm run dev
 - `MODAL_VLLM_API_KEY`: optional bearer token if vLLM is started with `--api-key`
 - `MODAL_VLLM_TIMEOUT_SECONDS`: HTTP timeout for backend->Modal inference calls
 - `DATA_STORE_PATH`: optional JSON storage path
+
+## AI Tools used
+- Codex: scaffolding code base.
+- ChatGPT: fixing small bugs and understanding code.
+- Claude: converting Figma into frontend code.

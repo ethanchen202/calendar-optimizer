@@ -1,13 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type {
   KeyboardEvent as ReactKeyboardEvent,
-  MouseEvent as ReactMouseEvent,
-  WheelEvent as ReactWheelEvent
+  MouseEvent as ReactMouseEvent
 } from "react";
 import { ApiClient } from "./api";
 import type {
   CalendarEvent as BackendCalendarEvent,
-  ChatDelta,
   EnergyInterval,
   EnergyProfile,
   UserState
@@ -17,11 +15,16 @@ type ViewMode = "week" | "month" | "day" | "3days";
 type TopTab = "calendar" | "insights";
 type EnergyTab = "day" | "week" | "month" | "year";
 type SidebarMode = "chat" | "todo";
-type ColorClass = "dark" | "light" | "blue" | "green";
+type ColorClass = "dark" | "light" | "blue" | "green" | "blueLight" | "greenLight";
+type PriorityTag = "High" | "Medium" | "Low";
+type PlannerItemKind = "todo" | "deadline";
+type PlannerCategory = "Exams" | "Homework" | "Study" | "General";
+type PlannerCadence = "once" | "weekdays" | "daily" | "times_per_week";
 
 type EventItem = {
   id: number;
   backendId?: string;
+  sourcePlannerItemId?: number;
   date: string;
   sh: number;
   eh: number;
@@ -63,13 +66,47 @@ type GridAnim = "next" | "prev" | "fade";
 type DragMode = "move" | "resize-start" | "resize-end";
 
 type DragState = {
-  eventId: number;
+  target: "event" | "projected";
+  itemId: number;
   mode: DragMode;
   startY: number;
   startSh: number;
   startEh: number;
   startDate: string;
   moved: boolean;
+};
+
+type PlannerItem = {
+  id: number;
+  title: string;
+  kind: PlannerItemKind;
+  category: PlannerCategory;
+  priority: PriorityTag;
+  dueDate: string;
+  estimateMinutes: number;
+  cadence: PlannerCadence;
+  timesPerWeek?: number;
+  fixedTime?: string | null;
+  splitPreferred?: boolean;
+  completed: boolean;
+};
+
+type ProjectedPlanBlock = {
+  id: number;
+  plannerItemId: number;
+  title: string;
+  date: string;
+  sh: number;
+  eh: number;
+  priority: PriorityTag;
+  reason: string;
+  fixed?: boolean;
+};
+
+type HoverReasonAnchor = {
+  x: number;
+  y: number;
+  side: "right" | "left";
 };
 
 const DEFAULT_API_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
@@ -92,7 +129,7 @@ const MONTHS = [
 ];
 const HOUR_H = 84;
 const START_H = 7;
-const COLOR_ORDER: ColorClass[] = ["dark", "light", "blue", "green"];
+const COLOR_ORDER: ColorClass[] = ["dark", "blue", "green"];
 const WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const DEFAULT_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 const EMPTY_ENERGY_PROFILE: EnergyProfile = {
@@ -103,19 +140,9 @@ const EMPTY_ENERGY_PROFILE: EnergyProfile = {
   updated_at: null
 };
 
-const SCHEDULE = [
-  { title: "ADV250", sh: 9, eh: 10, c: "dark", emoji: "😴" },
-  { title: "Studying", sh: 10, eh: 10.67, c: "light", emoji: null },
-  { title: "Brunch", sh: 11, eh: 11.67, c: "light", emoji: "😁" },
-  { title: "MATH257", sh: 12, eh: 13.67, c: "dark", emoji: "🤓" },
-  { title: "Studying for CS173", sh: 14, eh: 15.25, c: "light", emoji: "🥱" },
-  { title: "Client Call", sh: 15.5, eh: 16.25, c: "dark", emoji: null },
-  { title: "Dinner", sh: 16.5, eh: 17.25, c: "light", emoji: "🙂" }
-] as const;
-
-const SCHED_START = 9;
-const SCHED_END = 17;
-const SCHED_HOUR_H = 52;
+const POPUP_START_H = START_H;
+const POPUP_END_H = 22;
+const POPUP_HOUR_H = 26;
 
 function weekOf(date: Date): Date {
   const dow = date.getDay();
@@ -194,6 +221,168 @@ function eventColorFromSeed(seed: string): ColorClass {
   return COLOR_ORDER[Math.abs(hash) % COLOR_ORDER.length];
 }
 
+function isTodoColor(color: ColorClass): boolean {
+  return color === "light" || color === "blueLight" || color === "greenLight";
+}
+
+function summarizeEnergyProfileUpdate(
+  previous: EnergyProfile,
+  next: EnergyProfile,
+  description: string
+): string {
+  const prevCount = previous.intervals.length;
+  const nextCount = next.intervals.length;
+  const delta = nextCount - prevCount;
+  const hardBlocks = next.intervals.filter((interval) => interval.hard_block).length;
+  const sample = next.intervals
+    .slice(0, 3)
+    .map((interval) => {
+      const levelText = interval.hard_block
+        ? "hard block"
+        : `energy ${interval.energy_level > 0 ? `+${interval.energy_level}` : interval.energy_level}`;
+      const label = interval.label?.trim() || interval.id;
+      return `${label} ${interval.start_time}-${interval.end_time} (${levelText})`;
+    })
+    .join("; ");
+  const inferredTakeaways: string[] = [];
+  if (/\b(productive|focus|energ|alert)\b/i.test(description)) {
+    inferredTakeaways.push("captured productive/focus windows");
+  }
+  if (/\b(tired|drained|low energy|slump)\b/i.test(description)) {
+    inferredTakeaways.push("captured low-energy windows");
+  }
+  if (/\b(avoid|busy|blocked|cannot)\b/i.test(description)) {
+    inferredTakeaways.push("added blocked times");
+  }
+
+  return [
+    "Energy profile updated.",
+    `Main changes: ${nextCount} interval${nextCount === 1 ? "" : "s"} (${delta >= 0 ? `+${delta}` : `${delta}`} vs previous), ${hardBlocks} hard block${hardBlocks === 1 ? "" : "s"}.`,
+    `Detected windows: ${sample || "No structured windows were detected from this input."}`,
+    `Takeaways: ${inferredTakeaways.length > 0 ? inferredTakeaways.join(", ") : "general routine notes were integrated."}`
+  ].join("\n");
+}
+
+function colorForConfirmedBlock(block: ProjectedPlanBlock, item: PlannerItem | undefined): ColorClass {
+  const title = `${block.title} ${item?.title ?? ""}`.toLowerCase();
+  if (item?.category === "Exams" || /\bexam|quiz|test|examlet\b/.test(title)) {
+    return "dark";
+  }
+  if (/\bwater\b/.test(title)) {
+    return "blueLight";
+  }
+  if (/\barc\b|\bgym\b|\bworkout\b/.test(title)) {
+    return "greenLight";
+  }
+  if (item?.category === "Homework" || /\bhomework|project|mp\b/.test(title)) {
+    return "blueLight";
+  }
+  if (block.fixed) {
+    return "blue";
+  }
+  return "light";
+}
+
+function withPreservedSuffix(existingTitle: string, nextBase: string): string {
+  const suffixMatch = existingTitle.match(/\s\((Mon|Tue|Wed|Thu|Fri|Sat|Sun|Part \d+)\)$/);
+  if (!suffixMatch) {
+    return nextBase;
+  }
+  return `${nextBase} (${suffixMatch[1]})`;
+}
+
+const EVENT_META_MARKER = "__aura__";
+
+function stripEventMetadataFromId(backendId: string): string {
+  const [base] = backendId.split(EVENT_META_MARKER);
+  return base || backendId;
+}
+
+function encodeEventMetadataIntoId(item: EventItem): string {
+  const baseId = stripEventMetadataFromId(item.backendId ?? `calendar_${item.id}`);
+  const meta: string[] = [`c=${item.c}`, `d=${item.done ? 1 : 0}`];
+  if (item.sourcePlannerItemId !== undefined) {
+    meta.push(`p=${item.sourcePlannerItemId}`);
+  }
+  return `${baseId}${EVENT_META_MARKER}${meta.join(";")}`;
+}
+
+function decodeEventMetadataFromId(
+  backendId: string | null | undefined
+): { baseId: string; color?: ColorClass; done?: boolean; plannerId?: number } {
+  if (!backendId || !backendId.includes(EVENT_META_MARKER)) {
+    return { baseId: backendId ?? "" };
+  }
+  const [baseId, metaPart] = backendId.split(EVENT_META_MARKER);
+  const entries = (metaPart ?? "").split(";");
+  const parsed: { baseId: string; color?: ColorClass; done?: boolean; plannerId?: number } = { baseId };
+  for (const entry of entries) {
+    const [rawKey, rawValue] = entry.split("=");
+    const key = (rawKey ?? "").trim();
+    const value = (rawValue ?? "").trim();
+    if (key === "c" && value) {
+      if (
+        value === "dark" ||
+        value === "light" ||
+        value === "blue" ||
+        value === "green" ||
+        value === "blueLight" ||
+        value === "greenLight"
+      ) {
+        parsed.color = value;
+      }
+    }
+    if (key === "d") {
+      parsed.done = value === "1";
+    }
+    if (key === "p") {
+      const parsedPlannerId = Number(value);
+      if (!Number.isNaN(parsedPlannerId)) {
+        parsed.plannerId = parsedPlannerId;
+      }
+    }
+  }
+  return parsed;
+}
+
+function inferTodoItemFromEvents(plannerId: number, linkedEvents: EventItem[]): PlannerItem {
+  const sorted = [...linkedEvents].sort((a, b) => a.date.localeCompare(b.date) || a.sh - b.sh);
+  const first = sorted[0];
+  const title = first.title.replace(/\s\((Mon|Tue|Wed|Thu|Fri|Sat|Sun|Part \d+)\)$/, "").trim();
+  const done = sorted.every((eventItem) => eventItem.done);
+  const dates = [...new Set(sorted.map((eventItem) => eventItem.date))];
+  const cadence: PlannerCadence =
+    dates.length >= 7 ? "daily" : dates.length >= 5 ? "weekdays" : dates.length >= 2 ? "times_per_week" : "once";
+  const timesPerWeek = cadence === "times_per_week" ? dates.length : undefined;
+  const category: PlannerCategory =
+    /\bexam|quiz|test|examlet\b/i.test(title)
+      ? "Exams"
+      : /\bhomework|project|mp\b/i.test(title)
+        ? "Homework"
+        : /\bstudy|review|lesson\b/i.test(title)
+          ? "Study"
+          : "General";
+  return {
+    id: plannerId,
+    title,
+    kind: /\bexam|quiz|test|due|deadline\b/i.test(title) ? "deadline" : "todo",
+    category,
+    priority: category === "Exams" ? "High" : category === "Homework" ? "Medium" : "Low",
+    dueDate: dates[dates.length - 1] ?? fmtDate(new Date()),
+    estimateMinutes: Math.max(
+      15,
+      Math.round(
+        (sorted.reduce((sum, eventItem) => sum + (eventItem.eh - eventItem.sh) * 60, 0) / Math.max(sorted.length, 1))
+      )
+    ),
+    cadence,
+    timesPerWeek,
+    fixedTime: null,
+    splitPreferred: false,
+    completed: done
+  };
+}
+
 function mapBackendEventsToUiEvents(calendarEvents: BackendCalendarEvent[]): EventItem[] {
   const sorted = [...calendarEvents].sort((a, b) => {
     const aTs = new Date(a.start).getTime();
@@ -216,16 +405,18 @@ function mapBackendEventsToUiEvents(calendarEvents: BackendCalendarEvent[]): Eve
 
     const sh = fromIsoToHour(start);
     const eh = Math.max(fromIsoToHour(end), sh + 0.25);
-    const seed = item.id && item.id.trim() ? item.id : `${item.title}-${item.start}`;
+    const decoded = decodeEventMetadataFromId(item.id ?? null);
+    const seed = decoded.baseId && decoded.baseId.trim() ? decoded.baseId : `${item.title}-${item.start}`;
     mapped.push({
       id: localId,
-      backendId: item.id ?? `calendar_${localId}`,
+      backendId: decoded.baseId || item.id || `calendar_${localId}`,
+      sourcePlannerItemId: decoded.plannerId,
       date: fmtDate(start),
       sh,
       eh,
       title: item.title,
-      c: eventColorFromSeed(seed),
-      done: false
+      c: decoded.color ?? eventColorFromSeed(seed),
+      done: decoded.done ?? false
     });
     localId += 1;
   }
@@ -240,7 +431,7 @@ function mapUiEventsToBackendEvents(events: EventItem[]): BackendCalendarEvent[]
       return result;
     }
     result.push({
-      id: item.backendId ?? `calendar_${item.id}`,
+      id: encodeEventMetadataIntoId(item),
       title: item.title,
       start: start.toISOString(),
       end: end.toISOString()
@@ -309,15 +500,469 @@ function getErrorMessage(error: unknown): string {
   return "Unexpected error";
 }
 
-function hasStructuralDeltaChanges(delta: ChatDelta): boolean {
-  return Boolean(
-    delta.tasks_add.length > 0 ||
-      delta.task_ids_remove.length > 0 ||
-      delta.task_title_contains_remove.length > 0 ||
-      delta.calendar_add.length > 0 ||
-      delta.calendar_ids_remove.length > 0 ||
-      delta.calendar_title_contains_remove.length > 0
+function parseRelativeDueDate(fragment: string, baseDate: Date): string {
+  const text = fragment.toLowerCase();
+  const next = new Date(baseDate);
+  next.setHours(0, 0, 0, 0);
+  if (text.includes("today")) {
+    return fmtDate(next);
+  }
+  if (text.includes("tomorrow")) {
+    next.setDate(next.getDate() + 1);
+    return fmtDate(next);
+  }
+  const weekdayIndexMap: Record<string, number> = {
+    mon: 1,
+    monday: 1,
+    tue: 2,
+    tues: 2,
+    tuesday: 2,
+    wed: 3,
+    wednesday: 3,
+    thu: 4,
+    thur: 4,
+    thurs: 4,
+    thursday: 4,
+    fri: 5,
+    friday: 5,
+    sat: 6,
+    saturday: 6,
+    sun: 0,
+    sunday: 0
+  };
+  for (const [label, weekday] of Object.entries(weekdayIndexMap)) {
+    if (text.includes(label)) {
+      const delta = (weekday - next.getDay() + 7) % 7 || 7;
+      next.setDate(next.getDate() + delta);
+      return fmtDate(next);
+    }
+  }
+  const explicitDateMatch = text.match(/\b(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?\b/);
+  if (explicitDateMatch) {
+    const month = Number(explicitDateMatch[1]);
+    const day = Number(explicitDateMatch[2]);
+    const yearPart = explicitDateMatch[3];
+    const year = yearPart
+      ? Number(yearPart.length === 2 ? `20${yearPart}` : yearPart)
+      : next.getFullYear();
+    const explicit = new Date(year, month - 1, day);
+    if (!Number.isNaN(explicit.getTime())) {
+      return fmtDate(explicit);
+    }
+  }
+  const monthDayMatch = text.match(
+    /\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2})\b/
   );
+  if (monthDayMatch) {
+    const monthNames = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+    const monthName = monthDayMatch[1].slice(0, 3).toLowerCase();
+    const month = monthNames.indexOf(monthName);
+    const day = Number(monthDayMatch[2]);
+    if (month >= 0) {
+      const explicit = new Date(next.getFullYear(), month, day);
+      if (!Number.isNaN(explicit.getTime())) {
+        return fmtDate(explicit);
+      }
+    }
+  }
+  const fallback = new Date(baseDate);
+  fallback.setDate(fallback.getDate() + 5);
+  return fmtDate(fallback);
+}
+
+function parsePriority(fragment: string): PriorityTag {
+  const lower = fragment.toLowerCase();
+  if (/\b(urgent|asap|critical|high)\b/.test(lower)) {
+    return "High";
+  }
+  if (/\b(low|whenever|later)\b/.test(lower)) {
+    return "Low";
+  }
+  return "Medium";
+}
+
+function parseEstimateMinutes(fragment: string): number {
+  const lower = fragment.toLowerCase();
+  const hoursMatch = lower.match(/(\d+(?:\.\d+)?)\s*(h|hr|hrs|hour|hours)\b/);
+  if (hoursMatch) {
+    const hours = Number(hoursMatch[1]);
+    if (!Number.isNaN(hours)) {
+      return Math.max(15, Math.round(hours * 60));
+    }
+  }
+  const minutesMatch = lower.match(/(\d+)\s*(m|min|mins|minute|minutes)\b/);
+  if (minutesMatch) {
+    const minutes = Number(minutesMatch[1]);
+    if (!Number.isNaN(minutes)) {
+      return Math.max(15, minutes);
+    }
+  }
+  if (/\b(call|email|follow up|reply)\b/.test(lower)) {
+    return 30;
+  }
+  if (/\bstudy|review|project|assignment|write\b/.test(lower)) {
+    return 90;
+  }
+  return 60;
+}
+
+function parseClockToHourFloat(text: string): number | null {
+  if (/\bmidnight\b/i.test(text)) {
+    return 23.9833;
+  }
+  if (/\bnoon\b/i.test(text)) {
+    return 12;
+  }
+  const matches = [...text.matchAll(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/gi)];
+  for (const match of matches) {
+    const rawHour = Number(match[1]);
+    const rawMinute = Number(match[2] ?? "0");
+    const meridiem = (match[3] ?? "").toLowerCase();
+    if (Number.isNaN(rawHour) || Number.isNaN(rawMinute)) {
+      continue;
+    }
+    let hour = rawHour;
+    if (meridiem === "pm" && hour < 12) {
+      hour += 12;
+    }
+    if (meridiem === "am" && hour === 12) {
+      hour = 0;
+    }
+    if (hour >= 0 && hour <= 23 && rawMinute <= 59) {
+      return hour + rawMinute / 60;
+    }
+  }
+  return null;
+}
+
+function splitTaskClauses(message: string): string[] {
+  const cleaned = message.replace(/\r/g, "\n");
+  return cleaned
+    .split(/\n|;|•|\.(?=\s|$)|,/)
+    .map((line) => line.replace(/^\s*(and|then)\s+/i, "").trim())
+    .filter((line) => line.length > 0);
+}
+
+function normalizeCourseCode(raw: string): string {
+  return raw.replace(/\s+/g, "").toUpperCase();
+}
+
+function normalizeTaskTitle(line: string, course: string): string {
+  const compactCourse = course ? normalizeCourseCode(course) : "";
+  const lower = line.toLowerCase().replace(/\s+/g, " ");
+
+  if (/\b(arc|gym)\b/i.test(line)) {
+    return "ARC";
+  }
+  if (/\b(drink|water)\b/i.test(line)) {
+    return "Drink water";
+  }
+  if (compactCourse && /\bdaily lessons?\b/i.test(line)) {
+    return `${compactCourse} daily lesson`;
+  }
+  if (compactCourse && /\bhomework\b/i.test(line)) {
+    return `${compactCourse} homework`;
+  }
+  if (compactCourse && /\bmachine project\b/i.test(line)) {
+    return `${compactCourse} machine project`;
+  }
+
+  const cleaned = lower
+    .replace(/\b(i need to|need to|have to|i have to|finish|complete|do|work on|go to|please|my)\b/g, "")
+    .replace(/\b(daily|every day|each day|today|tomorrow)\b/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (compactCourse && cleaned.length > 0) {
+    return `${compactCourse} ${cleaned}`.trim();
+  }
+  return cleaned || (compactCourse ? compactCourse : line.trim());
+}
+
+function findNextWeekday(baseDate: Date, weekdayName: string): string {
+  const map: Record<string, number> = {
+    monday: 1,
+    tuesday: 2,
+    wednesday: 3,
+    thursday: 4,
+    friday: 5,
+    saturday: 6,
+    sunday: 0
+  };
+  const targetDow = map[weekdayName.toLowerCase()];
+  if (targetDow === undefined) {
+    return fmtDate(baseDate);
+  }
+  const next = new Date(baseDate);
+  next.setHours(0, 0, 0, 0);
+  const diff = (targetDow - next.getDay() + 7) % 7 || 7;
+  next.setDate(next.getDate() + diff);
+  return fmtDate(next);
+}
+
+function buildPlannerItem(input: {
+  title: string;
+  kind: PlannerItemKind;
+  category: PlannerCategory;
+  priority: PriorityTag;
+  dueDate: string;
+  estimateMinutes: number;
+  cadence?: PlannerCadence;
+  timesPerWeek?: number;
+  fixedTime?: string | null;
+  idSeed: number;
+}): PlannerItem {
+  return {
+    id: input.idSeed,
+    title: input.title,
+    kind: input.kind,
+    category: input.category,
+    priority: input.priority,
+    dueDate: input.dueDate,
+    estimateMinutes: input.estimateMinutes,
+    cadence: input.cadence ?? "once",
+    timesPerWeek: input.timesPerWeek,
+    fixedTime: input.fixedTime ?? null,
+    completed: false
+  };
+}
+
+function parsePlannerPayloadFromMessage(
+  message: string,
+  baseDate: Date
+): { items: PlannerItem[]; suggestedBlocks: ProjectedPlanBlock[] } {
+  const lines = splitTaskClauses(message);
+  const items: PlannerItem[] = [];
+  const suggestedBlocks: ProjectedPlanBlock[] = [];
+  let idSeed = Date.now();
+  let blockSeed = Date.now() + 50000;
+  let latestExam: { title: string; dueDate: string } | null = null;
+
+  for (const line of lines) {
+    const lower = line.toLowerCase();
+    const weekdayMatch = lower.match(/\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/);
+    const dueDate = weekdayMatch ? findNextWeekday(baseDate, weekdayMatch[1]) : parseRelativeDueDate(line, baseDate);
+    const hasExamKeyword = /\b(examlet|exam|quiz|test)\b/i.test(line);
+    const courseMatch = line.match(/\b([A-Za-z]{2,}\s*\d{2,3})\b/i);
+    const course = courseMatch ? normalizeCourseCode(courseMatch[1]) : "";
+    const clock = parseClockToHourFloat(line);
+    const fixedTime = clock === null ? null : fmtTime(clock);
+    const hasCallKeyword = /\b(call|meeting|appointment)\b/i.test(line);
+    const hasProjectKeyword = /\b(machine project|project)\b/i.test(line);
+    const wantsSplit = /\b(multiple|spread out|split)\b/i.test(line);
+    const isDaily = /\b(daily|every day|each day)\b/i.test(line);
+    const isWeekdays = /\bevery weekday\b/i.test(line);
+    const timesPerWeekMatch = lower.match(/\b([1-7])\s*times?\s*(a|per)\s*week\b/);
+    const timesPerWeek = timesPerWeekMatch ? Number(timesPerWeekMatch[1]) : undefined;
+
+    if (hasExamKeyword && weekdayMatch && clock !== null) {
+      const examKeywordMatch = line.match(/\b(examlet|exam|quiz|test)\b/i);
+      const examKeyword = examKeywordMatch ? examKeywordMatch[1] : "Exam";
+      const examTitle = `${course ? `${course} ` : ""}${examKeyword[0].toUpperCase()}${examKeyword.slice(1)}`.trim();
+      const examItem = buildPlannerItem({
+        idSeed,
+        title: examTitle,
+        kind: "deadline",
+        category: "Exams",
+        priority: "High",
+        dueDate,
+        estimateMinutes: 90,
+        fixedTime
+      });
+      idSeed += 1;
+      items.push(examItem);
+      latestExam = { title: examTitle, dueDate };
+      suggestedBlocks.push({
+        id: blockSeed,
+        plannerItemId: examItem.id,
+        title: examTitle,
+        date: dueDate,
+        sh: clock,
+        eh: Math.min(clock + 1, 22),
+        priority: "High",
+        fixed: true,
+        reason: "Fixed assessment time from your message."
+      });
+      blockSeed += 1;
+    }
+
+    if (hasCallKeyword && weekdayMatch && clock !== null) {
+      const callTitleMatch = line.match(/\b(client call|call|meeting|appointment)\b/i);
+      const callTitle = callTitleMatch ? callTitleMatch[1] : "Call";
+      const title = course ? `${course} ${callTitle}` : callTitle;
+      const callItem = buildPlannerItem({
+        idSeed,
+        title: title
+          .split(" ")
+          .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+          .join(" "),
+        kind: "deadline",
+        category: "General",
+        priority: "High",
+        dueDate,
+        estimateMinutes: 60,
+        fixedTime
+      });
+      idSeed += 1;
+      items.push(callItem);
+      suggestedBlocks.push({
+        id: blockSeed,
+        plannerItemId: callItem.id,
+        title: callItem.title,
+        date: dueDate,
+        sh: clock,
+        eh: Math.min(clock + 1, 22),
+        priority: "High",
+        fixed: true,
+        reason: "Fixed call time from your message."
+      });
+      blockSeed += 1;
+    }
+
+    if (/\bstudy\b/i.test(line) && (latestExam || hasExamKeyword)) {
+      const target = latestExam?.title ?? `${course} exam`;
+      const targetDue = latestExam?.dueDate ?? dueDate;
+      const estimate = /\ba lot\b/i.test(line) ? 180 : parseEstimateMinutes(line);
+      items.push(
+        buildPlannerItem({
+          idSeed,
+          title: `Study for ${target}`,
+          kind: "todo",
+          category: "Study",
+          priority: "High",
+          dueDate: targetDue,
+          estimateMinutes: Math.max(60, estimate)
+        })
+      );
+      idSeed += 1;
+    }
+
+    if (/\breview\b/i.test(line) && (latestExam || hasExamKeyword || /\bquiz\b/i.test(line))) {
+      const quizTitle = course ? `${course} Quiz` : latestExam?.title ?? "Quiz";
+      const targetDue = latestExam?.dueDate ?? dueDate;
+      items.push(
+        buildPlannerItem({
+          idSeed,
+          title: `Review for ${quizTitle}`,
+          kind: "todo",
+          category: "Study",
+          priority: "Medium",
+          dueDate: targetDue,
+          estimateMinutes: 90
+        })
+      );
+      idSeed += 1;
+    }
+
+    if (/\bhomework\b/i.test(line)) {
+      const title = normalizeTaskTitle(line, course);
+      const cadence: PlannerCadence = isDaily
+        ? "daily"
+        : isWeekdays
+          ? "weekdays"
+          : timesPerWeek
+            ? "times_per_week"
+            : "once";
+      const estimate =
+        /30\s*minutes?\s*to\s*an?\s*hour/i.test(lower) || /30\s*minutes?\s*to\s*1\s*hour/i.test(lower)
+          ? 45
+          : parseEstimateMinutes(line);
+      const hwItem = buildPlannerItem({
+        idSeed,
+        title,
+        kind: /\bdue\b|\bby\b/i.test(line) ? "deadline" : "todo",
+        category: "Homework",
+        priority: /\bmath\b/i.test(line) ? "High" : "Medium",
+        dueDate,
+        estimateMinutes: Math.max(30, estimate),
+        cadence,
+        timesPerWeek,
+        fixedTime: /\bdue\b|\bby\b/i.test(line) ? fixedTime : null
+      });
+      idSeed += 1;
+      items.push(hwItem);
+    }
+
+    if (hasProjectKeyword) {
+      const projectTitle =
+        course && /\bmachine project\b/i.test(line)
+          ? `${course} Machine Project`
+          : course
+            ? `${course} Project`
+            : "Project";
+      items.push(
+        buildPlannerItem({
+          idSeed,
+          title: projectTitle,
+          kind: /\bdue\b|\bby\b/i.test(line) ? "deadline" : "todo",
+          category: "Homework",
+          priority: "High",
+          dueDate,
+          estimateMinutes: wantsSplit ? 240 : 120
+        })
+      );
+      items[items.length - 1].splitPreferred = wantsSplit;
+      idSeed += 1;
+    }
+
+    if (!hasExamKeyword && !hasCallKeyword && !/\bhomework\b/i.test(line) && !hasProjectKeyword) {
+      if (isDaily || timesPerWeek || /\barc\b|\bgym\b|\bwater\b|\blesson\b/i.test(line)) {
+        const normalizedTitle = normalizeTaskTitle(line, course);
+        let cadence: PlannerCadence = isDaily
+          ? "daily"
+          : isWeekdays
+            ? "weekdays"
+            : timesPerWeek
+              ? "times_per_week"
+              : "once";
+        const category: PlannerCategory = /\blesson|study|review\b/i.test(line) ? "Study" : "General";
+        let estimateMinutes = parseEstimateMinutes(line);
+        let chosenTime = fixedTime;
+        if (/\bwater\b/i.test(line)) {
+          if (cadence === "once") {
+            cadence = "daily";
+          }
+          estimateMinutes = 15;
+          chosenTime = chosenTime ?? "10:30";
+        }
+        if (/\barc\b|\bgym\b/i.test(line)) {
+          estimateMinutes = Math.max(45, estimateMinutes);
+        }
+        items.push(
+          buildPlannerItem({
+            idSeed,
+            title: normalizedTitle,
+            kind: "todo",
+            category,
+            priority: /\bwater\b/i.test(line) ? "Low" : "Medium",
+            dueDate,
+            estimateMinutes,
+            cadence,
+            timesPerWeek,
+            fixedTime: chosenTime
+          })
+        );
+        idSeed += 1;
+      }
+    }
+  }
+
+  if (items.length > 0) {
+    return { items: items.slice(0, 30), suggestedBlocks };
+  }
+
+  const fallbackItems = lines.map((line, index) =>
+    buildPlannerItem({
+      idSeed: idSeed + index,
+      title: line,
+      kind: /\b(due|deadline|submit|by)\b/i.test(line) ? "deadline" : "todo",
+      category: "General",
+      priority: parsePriority(line),
+      dueDate: parseRelativeDueDate(line, baseDate),
+      estimateMinutes: parseEstimateMinutes(line)
+    })
+  );
+  return { items: fallbackItems.slice(0, 20), suggestedBlocks: [] };
 }
 
 function describeRecurrence(interval: EnergyInterval): string {
@@ -382,6 +1027,7 @@ function App() {
   const [calendarReady, setCalendarReady] = useState(false);
   const [calendarSyncState, setCalendarSyncState] = useState<"loading" | "ready" | "syncing" | "error">("loading");
   const [calendarSyncMessage, setCalendarSyncMessage] = useState("Loading calendar...");
+  const [backendOnline, setBackendOnline] = useState(true);
   const [energyProfile, setEnergyProfile] = useState<EnergyProfile>(EMPTY_ENERGY_PROFILE);
   const [energySaveState, setEnergySaveState] = useState<"idle" | "saving" | "success" | "error">("idle");
   const [popupSummaryMessage, setPopupSummaryMessage] = useState("Updated energy profile");
@@ -391,14 +1037,17 @@ function App() {
     {
       id: 1,
       role: "assistant",
-      text: "Hi! I'm your scheduling assistant. Ask me anything about your calendar."
+      text: "Tell me your tasks for today or this week. I will organize them into an editable list with due dates, priority, and time estimates."
     }
   ]);
   const [chatEmotions, setChatEmotions] = useState<string[]>([]);
-  const [pendingChatDelta, setPendingChatDelta] = useState<ChatDelta | null>(null);
-  const [pendingDeltaPreview, setPendingDeltaPreview] = useState<string[]>([]);
   const [isAnalyzingChat, setIsAnalyzingChat] = useState(false);
-  const [isApplyingChatDelta, setIsApplyingChatDelta] = useState(false);
+  const [plannerItems, setPlannerItems] = useState<PlannerItem[]>([]);
+  const [confirmedTodoItems, setConfirmedTodoItems] = useState<PlannerItem[]>([]);
+  const [projectedBlocks, setProjectedBlocks] = useState<ProjectedPlanBlock[]>([]);
+  const [hoveredProjectedId, setHoveredProjectedId] = useState<number | null>(null);
+  const [hoverReasonAnchor, setHoverReasonAnchor] = useState<HoverReasonAnchor | null>(null);
+  const [plannerPanelOpen, setPlannerPanelOpen] = useState(false);
 
   const [energyTab, setEnergyTab] = useState<EnergyTab>("day");
   const [auraMode, setAuraMode] = useState(false);
@@ -439,7 +1088,14 @@ function App() {
   const timeScrollRef = useRef<HTMLDivElement | null>(null);
   const eventPopupRef = useRef<HTMLDivElement | null>(null);
   const dayInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const calMainRef = useRef<HTMLDivElement | null>(null);
   const skipNextCalendarSyncRef = useRef(true);
+
+  const hoveredProjectedBlock = useMemo(
+    () => projectedBlocks.find((block) => block.id === hoveredProjectedId) ?? null,
+    [hoveredProjectedId, projectedBlocks]
+  );
+  const showPlannerColumn = sidebarMode === "chat" && plannerPanelOpen;
 
   const periodTitle = useMemo(
     () => buildPeriodTitle(curView, wkStart, curDate, mthDate),
@@ -472,11 +1128,15 @@ function App() {
         const widthPx = Math.max(88, 150 - cols * 11) + (eventItem.id % 3) * 20;
         const heightPx = Math.max(120, duration * HOUR_H * 1.75);
         const topPx = (centerHour - START_H) * HOUR_H - heightPx * 0.5;
-        const color =
-          eventItem.c === "dark"
-            ? "rgba(244, 154, 166, 0.52)"
-            : eventItem.c === "light"
+      const color =
+        eventItem.c === "dark"
+          ? "rgba(244, 154, 166, 0.52)"
+          : eventItem.c === "light"
               ? "rgba(250, 210, 145, 0.48)"
+            : eventItem.c === "blueLight"
+                ? "rgba(177, 218, 255, 0.48)"
+              : eventItem.c === "greenLight"
+                  ? "rgba(187, 237, 206, 0.46)"
               : eventItem.c === "blue"
                 ? "rgba(156, 198, 247, 0.50)"
                 : "rgba(172, 224, 191, 0.44)";
@@ -563,6 +1223,10 @@ function App() {
           ? "rgba(244, 154, 166, 0.44)"
           : eventItem.c === "light"
             ? "rgba(250, 210, 145, 0.4)"
+            : eventItem.c === "blueLight"
+                ? "rgba(177, 218, 255, 0.40)"
+              : eventItem.c === "greenLight"
+                  ? "rgba(187, 237, 206, 0.38)"
             : eventItem.c === "blue"
               ? "rgba(156, 198, 247, 0.42)"
               : "rgba(172, 224, 191, 0.38)";
@@ -584,6 +1248,19 @@ function App() {
     skipNextCalendarSyncRef.current = true;
     setEvents(mappedEvents);
     setNextId(mappedEvents.reduce((maxId, item) => Math.max(maxId, item.id), 0) + 1);
+    const linkedTodoGroups = new Map<number, EventItem[]>();
+    for (const eventItem of mappedEvents) {
+      if (!isTodoColor(eventItem.c) || eventItem.sourcePlannerItemId === undefined) {
+        continue;
+      }
+      const existing = linkedTodoGroups.get(eventItem.sourcePlannerItemId) ?? [];
+      existing.push(eventItem);
+      linkedTodoGroups.set(eventItem.sourcePlannerItemId, existing);
+    }
+    const rebuiltTodos = [...linkedTodoGroups.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([plannerId, linkedEvents]) => inferTodoItemFromEvents(plannerId, linkedEvents));
+    setConfirmedTodoItems(rebuiltTodos);
     setEnergyProfile(state.energy_profile ?? EMPTY_ENERGY_PROFILE);
 
     if (mappedEvents.length > 0) {
@@ -603,29 +1280,36 @@ function App() {
       const state = await api.getUserState(userId);
       applyHydratedState(state);
       const mappedEvents = mapBackendEventsToUiEvents(state.calendar_events ?? []);
+      setBackendOnline(true);
       setCalendarSyncState("ready");
       setCalendarSyncMessage(
         `Loaded ${mappedEvents.length} event${mappedEvents.length === 1 ? "" : "s"} from backend.`
       );
     } catch (error) {
-      setCalendarSyncState("error");
-      setCalendarSyncMessage(`Failed to load calendar: ${getErrorMessage(error)}`);
+      setBackendOnline(false);
+      setCalendarSyncState("ready");
+      setCalendarSyncMessage(`Backend unavailable, running in local mode (${getErrorMessage(error)}).`);
     } finally {
       setCalendarReady(true);
     }
   }
 
   async function syncCalendarToBackend(nextEvents: EventItem[]) {
+    if (!backendOnline) {
+      return;
+    }
     try {
       setCalendarSyncState("syncing");
       setCalendarSyncMessage("Saving calendar...");
       const payload = mapUiEventsToBackendEvents(nextEvents);
       await api.syncCalendar(userId, payload);
+      setBackendOnline(true);
       setCalendarSyncState("ready");
       setCalendarSyncMessage(`Synced ${payload.length} event${payload.length === 1 ? "" : "s"}.`);
     } catch (error) {
-      setCalendarSyncState("error");
-      setCalendarSyncMessage(`Calendar sync failed: ${getErrorMessage(error)}`);
+      setBackendOnline(false);
+      setCalendarSyncState("ready");
+      setCalendarSyncMessage(`Backend sync paused. Local changes are kept (${getErrorMessage(error)}).`);
     }
   }
 
@@ -634,7 +1318,7 @@ function App() {
   }, [api]);
 
   useEffect(() => {
-    if (!calendarReady) {
+    if (!calendarReady || !backendOnline) {
       return;
     }
     if (skipNextCalendarSyncRef.current) {
@@ -668,6 +1352,24 @@ function App() {
     }
     chatAreaRef.current.scrollTop = chatAreaRef.current.scrollHeight;
   }, [chatMessages]);
+
+  useEffect(() => {
+    setConfirmedTodoItems((current) =>
+      current.map((item) => {
+        const linkedTodoEvents = events.filter(
+          (eventItem) => eventItem.sourcePlannerItemId === item.id && isTodoColor(eventItem.c)
+        );
+        if (linkedTodoEvents.length === 0) {
+          return item;
+        }
+        const completed = linkedTodoEvents.every((eventItem) => eventItem.done);
+        if (completed === item.completed) {
+          return item;
+        }
+        return { ...item, completed };
+      })
+    );
+  }, [events]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -716,47 +1418,69 @@ function App() {
     const onMove = (event: MouseEvent) => {
       event.preventDefault();
       const didMove = Math.abs(event.clientY - dragState.startY) > 2;
-      if (didMove && !dragState.moved) {
-        setSuppressClickEventId(dragState.eventId);
+      if (didMove && !dragState.moved && dragState.target === "event") {
+        setSuppressClickEventId(dragState.itemId);
         setDragState((current) => (current ? { ...current, moved: true } : current));
       }
       const deltaHours = snapQuarter((event.clientY - dragState.startY) / HOUR_H);
 
-      setEvents((current) =>
-        current.map((item) => {
-          if (item.id !== dragState.eventId) {
-            return item;
-          }
-
-          const nextDate = (() => {
-            const el = document.elementFromPoint(event.clientX, event.clientY);
-            const target = el?.closest(".day-col[data-date]") as HTMLElement | null;
-            return target?.dataset.date ?? dragState.startDate;
-          })();
-
-          if (dragState.mode === "move") {
-            let sh = dragState.startSh + deltaHours;
-            let eh = sh + baseDuration;
-            if (sh < minHour) {
-              sh = minHour;
-              eh = sh + baseDuration;
+      const nextDate = (() => {
+        const el = document.elementFromPoint(event.clientX, event.clientY);
+        const target = el?.closest(".day-col[data-date]") as HTMLElement | null;
+        return target?.dataset.date ?? dragState.startDate;
+      })();
+      if (dragState.target === "event") {
+        setEvents((current) =>
+          current.map((item) => {
+            if (item.id !== dragState.itemId) {
+              return item;
             }
-            if (eh > maxHour) {
-              eh = maxHour;
-              sh = eh - baseDuration;
+
+            if (dragState.mode === "move") {
+              let sh = dragState.startSh + deltaHours;
+              let eh = sh + baseDuration;
+              if (sh < minHour) {
+                sh = minHour;
+                eh = sh + baseDuration;
+              }
+              if (eh > maxHour) {
+                eh = maxHour;
+                sh = eh - baseDuration;
+              }
+              return { ...item, date: nextDate, sh, eh };
             }
-            return { ...item, date: nextDate, sh, eh };
-          }
 
-          if (dragState.mode === "resize-start") {
-            const maxStart = dragState.startEh - minDuration;
-            const sh = Math.max(minHour, Math.min(dragState.startSh + deltaHours, maxStart));
-            return { ...item, sh };
-          }
+            if (dragState.mode === "resize-start") {
+              const maxStart = dragState.startEh - minDuration;
+              const sh = Math.max(minHour, Math.min(dragState.startSh + deltaHours, maxStart));
+              return { ...item, sh };
+            }
 
-          const minEnd = dragState.startSh + minDuration;
-          const eh = Math.min(maxHour, Math.max(dragState.startEh + deltaHours, minEnd));
-          return { ...item, eh };
+            const minEnd = dragState.startSh + minDuration;
+            const eh = Math.min(maxHour, Math.max(dragState.startEh + deltaHours, minEnd));
+            return { ...item, eh };
+          })
+        );
+        return;
+      }
+
+      setProjectedBlocks((current) =>
+        current.map((block) => {
+          if (block.id !== dragState.itemId) {
+            return block;
+          }
+          let sh = dragState.startSh + deltaHours;
+          let eh = dragState.startEh + deltaHours;
+          const duration = Math.max(block.eh - block.sh, 0.25);
+          if (sh < minHour) {
+            sh = minHour;
+            eh = sh + duration;
+          }
+          if (eh > maxHour) {
+            eh = maxHour;
+            sh = eh - duration;
+          }
+          return { ...block, date: nextDate, sh, eh };
         })
       );
     };
@@ -857,14 +1581,18 @@ function App() {
     if (!description || energySaveState === "saving") {
       return;
     }
+    const previousProfile = energyProfile;
     setEnergySaveState("saving");
     setPopupSummaryMessage("Updating energy profile...");
     setPopupStep(2);
     try {
       await api.updateEnergyProfile(userId, description);
-      await refreshCalendarFromBackend();
+      const state = await api.getUserState(userId);
+      applyHydratedState(state);
       setEnergySaveState("success");
-      setPopupSummaryMessage("Updated energy profile");
+      setPopupSummaryMessage(
+        summarizeEnergyProfileUpdate(previousProfile, state.energy_profile ?? EMPTY_ENERGY_PROFILE, description)
+      );
     } catch {
       setEnergySaveState("error");
       setPopupSummaryMessage("Unable to update energy profile");
@@ -924,7 +1652,7 @@ function App() {
   function toggleEventDone(eventId: number) {
     setEvents((current) =>
       current.map((item) => {
-        if (item.id !== eventId || item.c !== "light") {
+        if (item.id !== eventId || !isTodoColor(item.c)) {
           return item;
         }
         return { ...item, done: !item.done };
@@ -936,12 +1664,28 @@ function App() {
     event.preventDefault();
     event.stopPropagation();
     setDragState({
-      eventId: eventItem.id,
+      target: "event",
+      itemId: eventItem.id,
       mode,
       startY: event.clientY,
       startSh: eventItem.sh,
       startEh: eventItem.eh,
       startDate: eventItem.date,
+      moved: false
+    });
+  }
+
+  function startProjectedBlockDrag(event: ReactMouseEvent<HTMLDivElement>, block: ProjectedPlanBlock) {
+    event.preventDefault();
+    event.stopPropagation();
+    setDragState({
+      target: "projected",
+      itemId: block.id,
+      mode: "move",
+      startY: event.clientY,
+      startSh: block.sh,
+      startEh: block.eh,
+      startDate: block.date,
       moved: false
     });
   }
@@ -997,9 +1741,409 @@ function App() {
     setEventEditor((current) => ({ ...current, open: false }));
   }
 
+  function updatePlannerItem(itemId: number, changes: Partial<PlannerItem>) {
+    setPlannerItems((current) =>
+      current.map((item) => {
+        if (item.id !== itemId) {
+          return item;
+        }
+        return { ...item, ...changes };
+      })
+    );
+  }
+
+  function removePlannerItem(itemId: number) {
+    setPlannerItems((current) => current.filter((item) => item.id !== itemId));
+  }
+
+  function updateConfirmedTodoItem(itemId: number, changes: Partial<PlannerItem>) {
+    setConfirmedTodoItems((current) =>
+      current.map((item) => (item.id === itemId ? { ...item, ...changes } : item))
+    );
+    if (changes.title !== undefined) {
+      const nextTitle = changes.title.trim();
+      if (nextTitle) {
+        setEvents((current) =>
+          current.map((eventItem) =>
+            eventItem.sourcePlannerItemId === itemId
+              ? { ...eventItem, title: withPreservedSuffix(eventItem.title, nextTitle) }
+              : eventItem
+          )
+        );
+      }
+    }
+  }
+
+  function toggleConfirmedTodoDone(itemId: number) {
+    let nextDone = false;
+    setConfirmedTodoItems((current) =>
+      current.map((item) => {
+        if (item.id !== itemId) {
+          return item;
+        }
+        nextDone = !item.completed;
+        return { ...item, completed: nextDone };
+      })
+    );
+    setEvents((current) =>
+      current.map((eventItem) =>
+        eventItem.sourcePlannerItemId === itemId && isTodoColor(eventItem.c)
+          ? { ...eventItem, done: nextDone }
+          : eventItem
+      )
+    );
+  }
+
+  function removeConfirmedTodoItem(itemId: number) {
+    setConfirmedTodoItems((current) => current.filter((item) => item.id !== itemId));
+    setEvents((current) => current.filter((eventItem) => eventItem.sourcePlannerItemId !== itemId));
+  }
+
+  function regenerateScheduleFromTodos() {
+    if (confirmedTodoItems.length === 0) {
+      return;
+    }
+    const resetItems = confirmedTodoItems.map((item) => ({ ...item, completed: false }));
+    const todoIds = new Set(resetItems.map((item) => item.id));
+    setEvents((current) => current.filter((eventItem) => !todoIds.has(eventItem.sourcePlannerItemId ?? -1)));
+    setPlannerItems(resetItems);
+    setProjectedBlocks([]);
+    setHoveredProjectedId(null);
+    setHoverReasonAnchor(null);
+    setSidebarMode("chat");
+    setPlannerPanelOpen(true);
+    setChatMessages((current) => [
+      ...current,
+      {
+        id: Date.now(),
+        role: "assistant",
+        text: "Loaded your edited to-do list back into Weekly Task List. Click Generate Plan to create a refreshed schedule."
+      }
+    ]);
+  }
+
+  function priorityScore(priority: PriorityTag): number {
+    if (priority === "High") {
+      return 0;
+    }
+    if (priority === "Medium") {
+      return 1;
+    }
+    return 2;
+  }
+
+  function findOpenSlot(
+    occupied: Array<{ sh: number; eh: number }>,
+    preferredStarts: number[],
+    durationHours: number
+  ): { sh: number; eh: number } | null {
+    for (const startHour of preferredStarts) {
+      const sh = startHour;
+      const eh = Math.min(22, sh + durationHours);
+      const hasOverlap = occupied.some((slot) => sh < slot.eh && eh > slot.sh);
+      if (!hasOverlap && eh - sh >= 0.5) {
+        return { sh, eh };
+      }
+    }
+    return null;
+  }
+
+  function generateProjectedPlan() {
+    const activeItems = plannerItems.filter((item) => !item.completed && item.title.trim().length > 0);
+    if (activeItems.length === 0) {
+      setChatMessages((current) => [
+        ...current,
+        {
+          id: Date.now(),
+          role: "assistant",
+          text: "I need at least one active task before I can build your plan."
+        }
+      ]);
+      return;
+    }
+    const weekStart = weekOf(new Date(curDate));
+    const busyByDate = new Map<string, Array<{ sh: number; eh: number }>>();
+    for (const eventItem of events) {
+      const day = busyByDate.get(eventItem.date) ?? [];
+      day.push({ sh: eventItem.sh, eh: eventItem.eh });
+      busyByDate.set(eventItem.date, day);
+    }
+
+    const sorted = [...activeItems].sort((a, b) => {
+      const examDelta = (a.category === "Exams" ? -1 : 0) - (b.category === "Exams" ? -1 : 0);
+      if (examDelta !== 0) {
+        return examDelta;
+      }
+      const priorityDelta = priorityScore(a.priority) - priorityScore(b.priority);
+      if (priorityDelta !== 0) {
+        return priorityDelta;
+      }
+      return a.dueDate.localeCompare(b.dueDate);
+    });
+
+    const newBlocks: ProjectedPlanBlock[] = [];
+    let blockIdSeed = Date.now();
+    for (const item of sorted) {
+      if (item.fixedTime && item.cadence === "once") {
+        const sh = parseTime(item.fixedTime);
+        newBlocks.push({
+          id: blockIdSeed,
+          plannerItemId: item.id,
+          title: item.title,
+          date: item.dueDate,
+          sh,
+          eh: Math.min(sh + Math.max(0.5, item.estimateMinutes / 60), 22),
+          priority: item.priority,
+          reason: "Fixed event time based on your message.",
+          fixed: true
+        });
+        blockIdSeed += 1;
+        continue;
+      }
+
+      if (item.splitPreferred) {
+        let remaining = Math.max(90, item.estimateMinutes);
+        let part = 1;
+        const chunkMinutes = 90;
+        for (let dayOffset = 0; dayOffset < 7 && remaining > 0; dayOffset += 1) {
+          const date = new Date(weekStart);
+          date.setDate(weekStart.getDate() + dayOffset);
+          const maxDate = parseDateKey(item.dueDate);
+          if (maxDate && date > maxDate) {
+            break;
+          }
+          const dateKey = fmtDate(date);
+          const occupied = [...(busyByDate.get(dateKey) ?? []), ...newBlocks.filter((b) => b.date === dateKey)];
+          const slot = findOpenSlot(occupied, [9, 11, 14, 16], Math.max(0.5, Math.min(chunkMinutes, remaining) / 60));
+          if (!slot) {
+            continue;
+          }
+          newBlocks.push({
+            id: blockIdSeed,
+            plannerItemId: item.id,
+            title: `${item.title} (Part ${part})`,
+            date: dateKey,
+            sh: slot.sh,
+            eh: slot.eh,
+            priority: item.priority,
+            reason: "Split into multiple blocks for better progress and lower overload.",
+            fixed: false
+          });
+          blockIdSeed += 1;
+          part += 1;
+          remaining -= chunkMinutes;
+        }
+        continue;
+      }
+
+      if (item.cadence === "weekdays") {
+        for (let dayOffset = 0; dayOffset < 5; dayOffset += 1) {
+          const date = new Date(weekStart);
+          date.setDate(weekStart.getDate() + dayOffset);
+          const dateKey = fmtDate(date);
+          const occupied = [...(busyByDate.get(dateKey) ?? []), ...newBlocks.filter((b) => b.date === dateKey)];
+          const preferred = item.fixedTime ? [parseTime(item.fixedTime)] : [17, 18, 16, 19];
+          const slot = findOpenSlot(occupied, preferred, Math.max(0.5, item.estimateMinutes / 60));
+          if (!slot) {
+            continue;
+          }
+          newBlocks.push({
+            id: blockIdSeed,
+            plannerItemId: item.id,
+            title: `${item.title} (${WEEKDAY_NAMES[dayOffset]})`,
+            date: dateKey,
+            sh: slot.sh,
+            eh: slot.eh,
+            priority: item.priority,
+            reason: "Recurring weekday task placed in consistent after-class windows.",
+            fixed: false
+          });
+          blockIdSeed += 1;
+        }
+        continue;
+      }
+
+      if (item.cadence === "daily") {
+        for (let dayOffset = 0; dayOffset < 7; dayOffset += 1) {
+          const date = new Date(weekStart);
+          date.setDate(weekStart.getDate() + dayOffset);
+          const dateKey = fmtDate(date);
+          const occupied = [...(busyByDate.get(dateKey) ?? []), ...newBlocks.filter((b) => b.date === dateKey)];
+          const preferred =
+            item.fixedTime
+              ? [parseTime(item.fixedTime)]
+              : /\bwater\b/i.test(item.title)
+                ? [10.5, 15, 19]
+                : [18, 17, 8];
+          const slot = findOpenSlot(occupied, preferred, Math.max(0.25, item.estimateMinutes / 60));
+          if (!slot) {
+            continue;
+          }
+          newBlocks.push({
+            id: blockIdSeed,
+            plannerItemId: item.id,
+            title: `${item.title} (${WEEKDAY_NAMES[dayOffset]})`,
+            date: dateKey,
+            sh: slot.sh,
+            eh: slot.eh,
+            priority: item.priority,
+            reason: "Daily recurring task distributed across each day.",
+            fixed: false
+          });
+          blockIdSeed += 1;
+        }
+        continue;
+      }
+
+      if (item.cadence === "times_per_week") {
+        const targetCount = Math.min(Math.max(item.timesPerWeek ?? 1, 1), 7);
+        const spreadIndexes = Array.from({ length: targetCount }, (_, idx) =>
+          Math.round((idx * 6) / Math.max(targetCount - 1, 1))
+        );
+        const uniqueDays = [...new Set(spreadIndexes)];
+        for (const dayOffset of uniqueDays) {
+          const date = new Date(weekStart);
+          date.setDate(weekStart.getDate() + dayOffset);
+          const dateKey = fmtDate(date);
+          const occupied = [...(busyByDate.get(dateKey) ?? []), ...newBlocks.filter((b) => b.date === dateKey)];
+          const preferred = item.fixedTime ? [parseTime(item.fixedTime)] : [7, 8, 17, 18];
+          const slot = findOpenSlot(occupied, preferred, Math.max(0.5, item.estimateMinutes / 60));
+          if (!slot) {
+            continue;
+          }
+          newBlocks.push({
+            id: blockIdSeed,
+            plannerItemId: item.id,
+            title: `${item.title} (${WEEKDAY_NAMES[dayOffset]})`,
+            date: dateKey,
+            sh: slot.sh,
+            eh: slot.eh,
+            priority: item.priority,
+            reason: `${targetCount}x weekly routine spaced across the week for consistency.`,
+            fixed: false
+          });
+          blockIdSeed += 1;
+        }
+        continue;
+      }
+
+      const maxDate = parseDateKey(item.dueDate) ?? new Date(weekStart);
+      const durationHours = Math.max(0.5, Math.round((item.estimateMinutes / 60) * 4) / 4);
+      const preferredStarts =
+        item.category === "Study"
+          ? [9, 10, 13, 15]
+          : item.priority === "High"
+          ? [9, 10, 11, 14]
+          : item.priority === "Medium"
+            ? [11, 13, 15]
+            : [16, 17, 10];
+      let placed = false;
+      for (let dayOffset = 0; dayOffset < 7 && !placed; dayOffset += 1) {
+        const date = new Date(weekStart);
+        date.setDate(weekStart.getDate() + dayOffset);
+        if (date > maxDate) {
+          break;
+        }
+        const dateKey = fmtDate(date);
+        const occupied = [...(busyByDate.get(dateKey) ?? []), ...newBlocks.filter((b) => b.date === dateKey)];
+        const slot = findOpenSlot(occupied, preferredStarts, durationHours);
+        if (slot) {
+          const reasonBase =
+            item.category === "Study"
+              ? "Review/study block placed before the assessment to maximize retention."
+              : item.priority === "High"
+                ? "High priority item placed in a peak-focus window."
+              : item.priority === "Medium"
+                ? "Balanced priority slotted in a steady midday window."
+                : "Lower priority item placed in a lighter-energy window.";
+          const reason =
+            dateKey === item.dueDate
+              ? `${reasonBase} Scheduled on deadline date to avoid spillover.`
+              : `${reasonBase} Scheduled before the ${item.dueDate} deadline for buffer time.`;
+          newBlocks.push({
+            id: blockIdSeed,
+            plannerItemId: item.id,
+            title: item.title,
+            date: dateKey,
+            sh: slot.sh,
+            eh: slot.eh,
+            priority: item.priority,
+            reason,
+            fixed: false
+          });
+          blockIdSeed += 1;
+          placed = true;
+        }
+      }
+    }
+    setProjectedBlocks(newBlocks);
+    setHoveredProjectedId(null);
+    setHoverReasonAnchor(null);
+    setChatMessages((current) => [
+      ...current,
+      {
+        id: Date.now(),
+        role: "assistant",
+        text: `I mapped out ${newBlocks.length} draft block${newBlocks.length === 1 ? "" : "s"}. Tweak anything you want, then confirm to add them to your calendar.`
+      }
+    ]);
+  }
+
+  function confirmProjectedPlan() {
+    if (projectedBlocks.length === 0) {
+      return;
+    }
+    const plannerById = new Map(plannerItems.map((item) => [item.id, item]));
+    const nextEvents: EventItem[] = projectedBlocks.map((block, index) => ({
+      id: nextId + index,
+      backendId: `calendar_plan_${Date.now()}_${block.id}`,
+      sourcePlannerItemId: block.plannerItemId,
+      date: block.date,
+      sh: block.sh,
+      eh: block.eh,
+      title: block.title,
+      c: colorForConfirmedBlock(block, plannerById.get(block.plannerItemId)),
+      done: false
+    }));
+    setEvents((current) => [...current, ...nextEvents]);
+    setNextId((current) => current + nextEvents.length);
+    setConfirmedTodoItems((current) => [
+      ...current,
+      ...plannerItems.filter((item) => !item.completed)
+    ]);
+    setPlannerItems([]);
+    setProjectedBlocks([]);
+    setHoveredProjectedId(null);
+    setHoverReasonAnchor(null);
+    setPlannerPanelOpen(false);
+    setSidebarMode("todo");
+    setChatMessages((current) => [
+      ...current,
+      {
+        id: Date.now(),
+        role: "assistant",
+        text: "Great, your plan is confirmed. I moved everything into your To-Do List tab."
+      }
+    ]);
+  }
+
+  function discardProjectedPlan() {
+    setProjectedBlocks([]);
+    setHoveredProjectedId(null);
+    setHoverReasonAnchor(null);
+    setChatMessages((current) => [
+      ...current,
+      {
+        id: Date.now(),
+        role: "assistant",
+        text: "Cleared projected blocks. Share updated tasks and I can draft another plan."
+      }
+    ]);
+  }
+
   async function sendChat() {
     const message = chatInput.trim();
-    if (!message || isAnalyzingChat || isApplyingChatDelta) {
+    if (!message || isAnalyzingChat) {
       return;
     }
     const userMessageId = Date.now();
@@ -1009,94 +2153,47 @@ function App() {
     ]);
     setChatInput("");
     setIsAnalyzingChat(true);
-    try {
-      const response = await api.analyzeChat({
-        userId,
-        message,
-        timezone: DEFAULT_TIMEZONE,
-        useAI: true
-      });
-      setChatMessages((current) => [
-        ...current,
-        {
-          id: userMessageId + 1,
-          role: "assistant",
-          text: response.assistant_message
-        }
-      ]);
-      setChatEmotions(response.detected_emotions ?? []);
-
-      if (response.updated_energy_profile) {
-        setEnergyProfile(response.updated_energy_profile);
-      }
-
-      if (response.requires_confirmation && hasStructuralDeltaChanges(response.proposed_delta)) {
-        setPendingChatDelta(response.proposed_delta);
-        setPendingDeltaPreview(response.delta_preview);
-      } else {
-        setPendingChatDelta(null);
-        setPendingDeltaPreview([]);
-      }
-    } catch (error) {
-      setChatMessages((current) => [
-        ...current,
-        {
-          id: userMessageId + 1,
-          role: "assistant",
-          text: `Unable to process message: ${getErrorMessage(error)}`
-        }
-      ]);
-    } finally {
-      setIsAnalyzingChat(false);
+    const parsedPayload = parsePlannerPayloadFromMessage(message, curDate);
+    const parsedItems = parsedPayload.items;
+    const fixedBlocks = parsedPayload.suggestedBlocks;
+    const detected: string[] = [];
+    if (/\b(stress|overwhelm|anxious)\b/i.test(message)) {
+      detected.push("stressed");
     }
-  }
-
-  async function handleConfirmDelta() {
-    if (!pendingChatDelta || isApplyingChatDelta) {
+    if (/\b(excited|motivated|great)\b/i.test(message)) {
+      detected.push("motivated");
+    }
+    if (/\b(tired|exhausted|drained)\b/i.test(message)) {
+      detected.push("tired");
+    }
+    setChatEmotions(detected);
+    if (parsedItems.length === 0) {
+      setChatMessages((current) => [
+        ...current,
+        {
+          id: userMessageId + 1,
+          role: "assistant",
+          text: "I couldn’t find clear tasks in that message yet. Try short lines like: 'Submit biology draft by Friday, high priority, 2h'."
+        }
+      ]);
+      setIsAnalyzingChat(false);
       return;
     }
-    setIsApplyingChatDelta(true);
-    try {
-      const response = await api.applyChatDelta({
-        userId,
-        delta: pendingChatDelta
-      });
-      applyHydratedState(response.user_state);
-      setPendingChatDelta(null);
-      setPendingDeltaPreview([]);
-      setChatMessages((current) => [
-        ...current,
-        {
-          id: Date.now(),
-          role: "assistant",
-          text: "Applied confirmed changes."
-        }
-      ]);
-    } catch (error) {
-      setChatMessages((current) => [
-        ...current,
-        {
-          id: Date.now(),
-          role: "assistant",
-          text: `Failed to apply changes: ${getErrorMessage(error)}`
-        }
-      ]);
-    } finally {
-      setIsApplyingChatDelta(false);
+    setPlannerItems((current) => [...current, ...parsedItems]);
+    if (fixedBlocks.length > 0) {
+      setProjectedBlocks((current) => [...current, ...fixedBlocks]);
     }
-  }
-
-  function handleRejectDelta() {
-    setPendingChatDelta(null);
-    setPendingDeltaPreview([]);
+    setSidebarMode("chat");
+    setPlannerPanelOpen(true);
     setChatMessages((current) => [
       ...current,
       {
-        id: Date.now(),
+        id: userMessageId + 1,
         role: "assistant",
-        text: "Discarded pending changes."
+        text: `Found ${parsedItems.length} task${parsedItems.length === 1 ? "" : "s"} (${parsedItems.filter((item) => item.category === "Exams").length} exam${parsedItems.filter((item) => item.category === "Exams").length === 1 ? "" : "s"}). I added them to your list. Edit anything you want, then click Generate Plan.`
       }
     ]);
+    setIsAnalyzingChat(false);
   }
 
   function onChatKeyDown(event: ReactKeyboardEvent<HTMLTextAreaElement>) {
@@ -1104,21 +2201,6 @@ function App() {
       event.preventDefault();
       void sendChat();
     }
-  }
-
-  function handleCalendarWheel(container: HTMLDivElement, deltaY: number) {
-    if (container.scrollHeight <= container.clientHeight) {
-      return;
-    }
-    container.scrollTop += deltaY;
-  }
-
-  function handleCalendarWheelCapture(event: ReactWheelEvent<HTMLDivElement>) {
-    if (curView === "month" || !timeScrollRef.current) {
-      return;
-    }
-    event.preventDefault();
-    handleCalendarWheel(timeScrollRef.current, event.deltaY);
   }
 
   const monthCells = useMemo(() => {
@@ -1150,7 +2232,25 @@ function App() {
     return cells;
   }, [curView, mthDate]);
 
-  const totalScheduleHeight = (SCHED_END - SCHED_START) * SCHED_HOUR_H;
+  const popupToday = new Date();
+  const popupDateKey = fmtDate(popupToday);
+  const popupDayTitle = popupToday.toLocaleDateString("en-US", {
+    weekday: "long",
+    month: "short",
+    day: "numeric"
+  });
+  const popupDayEvents = useMemo(
+    () =>
+      events
+        .filter((eventItem) => eventItem.date === popupDateKey)
+        .sort((a, b) => a.sh - b.sh),
+    [events, popupDateKey]
+  );
+  const popupHours = useMemo(
+    () => Array.from({ length: POPUP_END_H - POPUP_START_H + 1 }, (_, idx) => POPUP_START_H + idx),
+    []
+  );
+  const totalScheduleHeight = (POPUP_END_H - POPUP_START_H) * POPUP_HOUR_H;
 
   return (
     <div style={{ height: "100vh", display: "flex", flexDirection: "column", overflow: "hidden" }}>
@@ -1203,7 +2303,15 @@ function App() {
             <select
               className="todo-select"
               value={sidebarMode}
-              onChange={(event) => setSidebarMode(event.target.value as SidebarMode)}
+              onChange={(event) => {
+                const nextMode = event.target.value as SidebarMode;
+                setSidebarMode(nextMode);
+                if (nextMode !== "chat") {
+                  setPlannerPanelOpen(false);
+                } else if (plannerItems.length > 0) {
+                  setPlannerPanelOpen(true);
+                }
+              }}
               aria-label="Sidebar mode"
             >
               <option value="todo">To-Do List</option>
@@ -1223,16 +2331,16 @@ function App() {
               style={{
                 fontSize: "12px",
                 fontWeight: 600,
-                color: calendarSyncState === "error" ? "#B42318" : "#4E4A67"
+                color: backendOnline ? "#4E4A67" : "#9E5F12"
               }}
             >
               {calendarSyncState === "loading"
                 ? "Connecting backend..."
                 : calendarSyncState === "syncing"
                   ? "Saving calendar..."
-                  : calendarSyncState === "error"
-                    ? "Backend sync failed"
-                    : "Backend connected"}
+                  : backendOnline
+                    ? "Backend connected"
+                    : "Local mode (offline)"}
             </div>
             <div
               style={{
@@ -1279,7 +2387,7 @@ function App() {
                   </div>
                 ))}
                 {isAnalyzingChat ? (
-                  <div className="chat-msg-ai">Analyzing...</div>
+                  <div className="chat-msg-ai">Organizing your task list...</div>
                 ) : null}
               </div>
               {chatEmotions.length > 0 ? (
@@ -1310,7 +2418,7 @@ function App() {
                     onClick={() => {
                       void sendChat();
                     }}
-                    disabled={chatInput.trim().length === 0 || isAnalyzingChat || isApplyingChatDelta}
+                    disabled={chatInput.trim().length === 0 || isAnalyzingChat}
                     aria-label="Send chat message"
                     title="Send chat message"
                   >
@@ -1318,87 +2426,188 @@ function App() {
                   </button>
                 </div>
               </div>
-              {pendingChatDelta ? (
-                <div
-                  style={{
-                    margin: "0 14px 14px",
-                    padding: "10px 12px",
-                    borderRadius: "10px",
-                    border: "1px solid #d9d5ec",
-                    background: "rgba(255, 255, 255, 0.9)"
-                  }}
-                >
-                  <div style={{ fontSize: "12px", fontWeight: 600, color: "#524d73", marginBottom: "6px" }}>
-                    Confirm changes
-                  </div>
-                  {pendingDeltaPreview.length === 0 ? (
-                    <div style={{ fontSize: "12px", color: "#686389" }}>
-                      Changes were proposed, but preview is empty.
-                    </div>
-                  ) : (
-                    <ul
-                      style={{
-                        margin: 0,
-                        paddingLeft: "16px",
-                        fontSize: "12px",
-                        color: "#686389"
-                      }}
-                    >
-                      {pendingDeltaPreview.map((line) => (
-                        <li key={line}>{line}</li>
-                      ))}
-                    </ul>
-                  )}
-                  <div style={{ display: "flex", gap: "8px", marginTop: "8px" }}>
-                    <button
-                      type="button"
-                      disabled={isApplyingChatDelta}
-                      style={{
-                        border: "none",
-                        borderRadius: "8px",
-                        padding: "6px 10px",
-                        background: "#5f5aa4",
-                        color: "white",
-                        fontSize: "12px",
-                        cursor: isApplyingChatDelta ? "default" : "pointer"
-                      }}
-                      onClick={() => {
-                        void handleConfirmDelta();
-                      }}
-                    >
-                      {isApplyingChatDelta ? "Applying..." : "Confirm"}
-                    </button>
-                    <button
-                      type="button"
-                      disabled={isApplyingChatDelta}
-                      style={{
-                        border: "1px solid #c9c4e2",
-                        borderRadius: "8px",
-                        padding: "6px 10px",
-                        background: "white",
-                        color: "#5f5aa4",
-                        fontSize: "12px",
-                        cursor: isApplyingChatDelta ? "default" : "pointer"
-                      }}
-                      onClick={handleRejectDelta}
-                    >
-                      Reject
-                    </button>
-                  </div>
-                </div>
-              ) : null}
             </>
           ) : (
             <div className="todo-list-wrap">
-              <div className="todo-item">Review ADV250 notes</div>
-              <div className="todo-item">Submit MATH257 problem set</div>
-              <div className="todo-item">Prep for client call</div>
-              <div className="todo-item">Plan CS173 study block</div>
+              {confirmedTodoItems.length === 0 ? (
+                <div className="todo-item">Confirm a generated plan to populate this list.</div>
+              ) : (
+                <>
+                  {confirmedTodoItems.map((item) => (
+                    <div key={`todo-${item.id}`} className="todo-item todo-edit-item">
+                      <div className="todo-edit-top">
+                        <button
+                          type="button"
+                          className={`planner-check ${item.completed ? "done" : ""}`}
+                          onClick={() => toggleConfirmedTodoDone(item.id)}
+                          aria-label={item.completed ? "Mark active" : "Mark done"}
+                        >
+                          {item.completed ? "✓" : ""}
+                        </button>
+                        <input
+                          className="todo-edit-title"
+                          value={item.title}
+                          onChange={(event) => updateConfirmedTodoItem(item.id, { title: event.target.value })}
+                        />
+                        <button
+                          type="button"
+                          className="planner-delete"
+                          onClick={() => removeConfirmedTodoItem(item.id)}
+                          aria-label="Delete to-do"
+                        >
+                          ×
+                        </button>
+                      </div>
+                      <div className="todo-edit-meta">
+                        <span className="planner-chip planner-category">{item.category}</span>
+                        <select
+                          className={`planner-chip planner-priority ${item.priority.toLowerCase()}`}
+                          value={item.priority}
+                          onChange={(event) =>
+                            updateConfirmedTodoItem(item.id, { priority: event.target.value as PriorityTag })
+                          }
+                          aria-label="Priority"
+                        >
+                          <option value="High">High</option>
+                          <option value="Medium">Medium</option>
+                          <option value="Low">Low</option>
+                        </select>
+                        <input
+                          className="planner-date"
+                          type="date"
+                          value={item.dueDate}
+                          onChange={(event) => updateConfirmedTodoItem(item.id, { dueDate: event.target.value })}
+                        />
+                        {item.cadence === "weekdays" ? (
+                          <span className="planner-chip planner-cadence">Weekdays</span>
+                        ) : item.cadence === "daily" ? (
+                          <span className="planner-chip planner-cadence">Daily</span>
+                        ) : item.cadence === "times_per_week" && item.timesPerWeek ? (
+                          <span className="planner-chip planner-cadence">{item.timesPerWeek}x/week</span>
+                        ) : null}
+                      </div>
+                    </div>
+                  ))}
+                  <button
+                    type="button"
+                    className="planner-generate-btn"
+                    onClick={regenerateScheduleFromTodos}
+                  >
+                    Regenerate Schedule
+                  </button>
+                </>
+              )}
             </div>
           )}
         </aside>
 
-        <div className={`cal-main ${auraMode ? "aura-on" : ""}`}>
+        <div className={`planner-column ${showPlannerColumn ? "open" : "closed"}`}>
+          <div className="planner-list">
+            <div className="planner-head">
+              <span>Weekly Task List</span>
+              <span>{plannerItems.filter((item) => !item.completed).length} active</span>
+            </div>
+            {plannerItems.length === 0 ? (
+              <div className="planner-empty">
+                Share your day/week tasks in chat. Aura will structure them with due dates, priorities, and estimates.
+              </div>
+            ) : (
+              plannerItems.map((item) => (
+                <div key={item.id} className={`planner-row ${item.completed ? "done" : ""}`}>
+                  <button
+                    type="button"
+                    className={`planner-check ${item.completed ? "done" : ""}`}
+                    onClick={() => updatePlannerItem(item.id, { completed: !item.completed })}
+                    aria-label={item.completed ? "Mark active" : "Mark done"}
+                  >
+                    {item.completed ? "✓" : ""}
+                  </button>
+                  <input
+                    className="planner-title-input"
+                    value={item.title}
+                    onChange={(event) => updatePlannerItem(item.id, { title: event.target.value })}
+                  />
+                  <div className="planner-meta-row">
+                    <span className={`planner-chip ${item.kind === "deadline" ? "deadline" : "todo"}`}>
+                      {item.kind === "deadline" ? "Deadline" : "To-do"}
+                    </span>
+                    <span className="planner-chip planner-category">{item.category}</span>
+                    {item.cadence === "weekdays" ? (
+                      <span className="planner-chip planner-cadence">Weekdays</span>
+                    ) : item.cadence === "daily" ? (
+                      <span className="planner-chip planner-cadence">Daily</span>
+                    ) : item.cadence === "times_per_week" && item.timesPerWeek ? (
+                      <span className="planner-chip planner-cadence">{item.timesPerWeek}x/week</span>
+                    ) : null}
+                    <select
+                      className={`planner-chip planner-priority ${item.priority.toLowerCase()}`}
+                      value={item.priority}
+                      onChange={(event) =>
+                        updatePlannerItem(item.id, { priority: event.target.value as PriorityTag })
+                      }
+                      aria-label="Select priority"
+                    >
+                      <option value="High">High</option>
+                      <option value="Medium">Medium</option>
+                      <option value="Low">Low</option>
+                    </select>
+                    <input
+                      className="planner-date"
+                      type="date"
+                      value={item.dueDate}
+                      onChange={(event) => updatePlannerItem(item.id, { dueDate: event.target.value })}
+                    />
+                    {item.fixedTime ? (
+                      <span className="planner-chip planner-fixed-time">{item.fixedTime}</span>
+                    ) : null}
+                    <label className="planner-estimate">
+                      <input
+                        type="number"
+                        min={15}
+                        step={15}
+                        value={item.estimateMinutes}
+                        onChange={(event) =>
+                          updatePlannerItem(item.id, {
+                            estimateMinutes: Math.max(15, Number(event.target.value) || 15)
+                          })
+                        }
+                      />
+                      min
+                    </label>
+                    <button
+                      type="button"
+                      className="planner-delete"
+                      onClick={() => removePlannerItem(item.id)}
+                      aria-label="Delete task"
+                    >
+                      ×
+                    </button>
+                  </div>
+                </div>
+              ))
+            )}
+            <button
+              type="button"
+              className="planner-generate-btn"
+              onClick={generateProjectedPlan}
+              disabled={plannerItems.filter((item) => !item.completed).length === 0}
+            >
+              Generate Plan
+            </button>
+            {projectedBlocks.length > 0 ? (
+              <div className="planner-plan-actions">
+                <button type="button" className="planner-confirm-btn" onClick={confirmProjectedPlan}>
+                  Confirm Plan
+                </button>
+                <button type="button" className="planner-clear-btn" onClick={discardProjectedPlan}>
+                  Clear Draft
+                </button>
+              </div>
+            ) : null}
+          </div>
+        </div>
+
+        <div className={`cal-main ${auraMode ? "aura-on" : ""}`} ref={calMainRef}>
           <div className="cal-header">
             <button className="cal-nav-btn" type="button" onClick={navPrev}>
               ‹
@@ -1440,10 +2649,7 @@ function App() {
             </button>
           </div>
 
-          <div
-            className={`cal-grid-wrap ${auraMode ? "aura-mode" : ""}`}
-            onWheelCapture={handleCalendarWheelCapture}
-          >
+          <div className={`cal-grid-wrap ${auraMode ? "aura-mode" : ""}`}>
             <div
               key={`${curView}-${periodTitle}-${gridAnimNonce}`}
               className={`cal-grid-content ${gridAnim === "next" ? "anim-next" : gridAnim === "prev" ? "anim-prev" : "anim-fade"}`}
@@ -1476,9 +2682,9 @@ function App() {
                         {cellEvents.map((eventItem) => (
                           <div
                             key={eventItem.id}
-                            className={`month-ev ${eventItem.c} ${eventItem.done && eventItem.c === "light" ? "done" : ""}`}
+                            className={`month-ev ${eventItem.c} ${eventItem.done && isTodoColor(eventItem.c) ? "done" : ""}`}
                           >
-                            {eventItem.done && eventItem.c === "light" ? "✓ " : ""}
+                            {eventItem.done && isTodoColor(eventItem.c) ? "✓ " : ""}
                             {eventItem.title}
                           </div>
                         ))}
@@ -1513,11 +2719,7 @@ function App() {
                     })}
                   </div>
 
-                  <div
-                    className="time-scroll"
-                    ref={timeScrollRef}
-                    onWheel={(event) => handleCalendarWheel(event.currentTarget, event.deltaY)}
-                  >
+                  <div className="time-scroll" ref={timeScrollRef}>
                     <div
                       className="time-inner"
                       style={{ gridTemplateColumns: `56px repeat(${colsForView(curView)},1fr)` }}
@@ -1561,6 +2763,7 @@ function App() {
                       {dateColumns.map((date) => {
                         const dateStr = fmtDate(date);
                         const dayEvents = events.filter((eventItem) => eventItem.date === dateStr);
+                        const dayProjectedBlocks = projectedBlocks.filter((block) => block.date === dateStr);
                         return (
                           <div key={dateStr} className="day-col" data-date={dateStr}>
                             {auraMode
@@ -1583,13 +2786,48 @@ function App() {
                                 onClick={(event) => handleCellClick(event, dateStr, hour)}
                               />
                             ))}
+                            {dayProjectedBlocks.map((block) => {
+                              const top = (block.sh - START_H) * HOUR_H + 2;
+                              const height = Math.max((block.eh - block.sh) * HOUR_H - 4, 16);
+                              return (
+                                <div
+                                  key={block.id}
+                                  className={`plan-ev-block ${dragState?.target === "projected" && dragState.itemId === block.id ? "drag-active" : ""}`}
+                                  style={{ top, height }}
+                                  onMouseDown={(event) => startProjectedBlockDrag(event, block)}
+                                  onMouseEnter={(event) => {
+                                    setHoveredProjectedId(block.id);
+                                    const blockRect = event.currentTarget.getBoundingClientRect();
+                                    const containerRect = calMainRef.current?.getBoundingClientRect();
+                                    if (!containerRect) {
+                                      return;
+                                    }
+                                    const popupWidth = 250;
+                                    const rightSpace = containerRect.right - blockRect.right;
+                                    const side: "right" | "left" = rightSpace > popupWidth + 16 ? "right" : "left";
+                                    const x =
+                                      side === "right"
+                                        ? blockRect.right - containerRect.left + 10
+                                        : blockRect.left - containerRect.left - popupWidth - 10;
+                                    const y = blockRect.top - containerRect.top + Math.min(12, Math.max(2, blockRect.height * 0.22));
+                                    setHoverReasonAnchor({ x, y, side });
+                                  }}
+                                  onMouseLeave={() => {
+                                    setHoveredProjectedId((current) => (current === block.id ? null : current));
+                                    setHoverReasonAnchor(null);
+                                  }}
+                                >
+                                  <span className="plan-ev-title">{block.title}</span>
+                                </div>
+                              );
+                            })}
                             {dayEvents.map((eventItem) => {
                               const top = (eventItem.sh - START_H) * HOUR_H + 2;
                               const height = Math.max((eventItem.eh - eventItem.sh) * HOUR_H - 4, 16);
                               return (
                                 <div
                                   key={eventItem.id}
-                                  className={`ev-block ${eventItem.c} ${auraMode ? "glass" : ""} ${dragState?.eventId === eventItem.id ? "drag-active" : ""}`}
+                                  className={`ev-block ${eventItem.c} ${auraMode ? "glass" : ""} ${dragState?.target === "event" && dragState.itemId === eventItem.id ? "drag-active" : ""}`}
                                   style={{ top, height }}
                                   onMouseDown={(event) => startEventDrag(event, eventItem, "move")}
                                   onClick={(event) => {
@@ -1606,7 +2844,7 @@ function App() {
                                     onMouseDown={(event) => startEventDrag(event, eventItem, "resize-start")}
                                     aria-label="Adjust start time"
                                   />
-                                  {eventItem.c === "light" ? (
+                                  {isTodoColor(eventItem.c) ? (
                                     <button
                                       type="button"
                                       className={`ev-check ${eventItem.done ? "done" : ""}`}
@@ -1622,7 +2860,7 @@ function App() {
                                       {eventItem.done ? "✓" : ""}
                                     </button>
                                   ) : null}
-                                  <span className={`ev-title ${eventItem.done && eventItem.c === "light" ? "done" : ""}`}>
+                                  <span className={`ev-title ${eventItem.done && isTodoColor(eventItem.c) ? "done" : ""}`}>
                                     {eventItem.title}
                                   </span>
                                   <button
@@ -1643,6 +2881,18 @@ function App() {
               )}
             </div>
           </div>
+          {hoveredProjectedBlock && hoverReasonAnchor ? (
+            <div
+              className={`plan-reason-popup ${hoverReasonAnchor.side === "left" ? "left-side" : "right-side"}`}
+              style={{
+                left: hoverReasonAnchor.x,
+                top: hoverReasonAnchor.y
+              }}
+            >
+              <div className="plan-reason-title">Why this slot</div>
+              <div className="plan-reason-body">{hoveredProjectedBlock.reason}</div>
+            </div>
+          ) : null}
 
           <button className="log-aura-outer" type="button" onClick={openAuraPopup}>
             <div className="log-aura-text">
@@ -1838,16 +3088,28 @@ function App() {
               </div>
             </div>
             <div className="popup-right">
-              <div className="popup-sched-title">Tuesday</div>
+              <div className="popup-sched-title">{popupDayTitle}</div>
               <div className="popup-sched-body">
                 <div className="popup-events-area" style={{ height: totalScheduleHeight }}>
-                  {SCHEDULE.map((item) => {
-                    const top = (item.sh - SCHED_START) * SCHED_HOUR_H;
-                    const height = Math.max((item.eh - item.sh) * SCHED_HOUR_H, 24);
+                  {popupHours.map((hour) => (
+                    <div
+                      key={`popup-grid-${hour}`}
+                      className="popup-grid-line"
+                      style={{ top: (hour - POPUP_START_H) * POPUP_HOUR_H }}
+                    />
+                  ))}
+                  {popupDayEvents.map((item) => {
+                    const clippedStart = Math.max(item.sh, POPUP_START_H);
+                    const clippedEnd = Math.min(item.eh, POPUP_END_H);
+                    if (clippedEnd <= clippedStart) {
+                      return null;
+                    }
+                    const top = (clippedStart - POPUP_START_H) * POPUP_HOUR_H;
+                    const height = Math.max((clippedEnd - clippedStart) * POPUP_HOUR_H, 20);
                     return (
                       <div
-                        key={`${item.title}-${item.sh}`}
-                        className={`popup-sched-event ${item.c} ${item.emoji ? "has-emoji" : ""}`}
+                        key={`popup-live-${item.id}`}
+                        className={`popup-sched-event ${item.c}`}
                         style={{ top, height }}
                       >
                         {item.title}
@@ -1856,11 +3118,11 @@ function App() {
                   })}
                 </div>
                 <div className="popup-time-col" style={{ height: totalScheduleHeight }}>
-                  {Array.from({ length: SCHED_END - SCHED_START + 1 }, (_, idx) => SCHED_START + idx).map((hour) => (
+                  {popupHours.map((hour) => (
                     <div
                       key={hour}
                       className="popup-time-lbl"
-                      style={{ top: (hour - SCHED_START) * SCHED_HOUR_H }}
+                      style={{ top: (hour - POPUP_START_H) * POPUP_HOUR_H }}
                     >
                       {hour < 12 ? `${hour}AM` : hour === 12 ? "12PM" : `${hour - 12}PM`}
                     </div>
@@ -1883,34 +3145,41 @@ function App() {
               </button>
             </div>
             <div className="popup-right">
-              <div className="popup-sched-title">Tuesday</div>
+              <div className="popup-sched-title">{popupDayTitle}</div>
               <div className="popup-sched-body">
                 <div className="popup-events-area" style={{ height: totalScheduleHeight }}>
-                  {SCHEDULE.map((item, index) => {
-                    const top = (item.sh - SCHED_START) * SCHED_HOUR_H;
-                    const height = Math.max((item.eh - item.sh) * SCHED_HOUR_H, 24);
+                  {popupHours.map((hour) => (
+                    <div
+                      key={`popup-grid-2-${hour}`}
+                      className="popup-grid-line"
+                      style={{ top: (hour - POPUP_START_H) * POPUP_HOUR_H }}
+                    />
+                  ))}
+                  {popupDayEvents.map((item) => {
+                    const clippedStart = Math.max(item.sh, POPUP_START_H);
+                    const clippedEnd = Math.min(item.eh, POPUP_END_H);
+                    if (clippedEnd <= clippedStart) {
+                      return null;
+                    }
+                    const top = (clippedStart - POPUP_START_H) * POPUP_HOUR_H;
+                    const height = Math.max((clippedEnd - clippedStart) * POPUP_HOUR_H, 20);
                     return (
                       <div
-                        key={`${item.title}-${item.sh}`}
-                        className={`popup-sched-event ${item.c} ${item.emoji ? "has-emoji" : ""}`}
+                        key={`popup-live-status-${item.id}`}
+                        className={`popup-sched-event ${item.c}`}
                         style={{ top, height }}
                       >
                         {item.title}
-                        {item.emoji ? (
-                          <div className="popup-emoji-badge" style={{ animationDelay: `${index * 80 + 120}ms` }}>
-                            {item.emoji}
-                          </div>
-                        ) : null}
                       </div>
                     );
                   })}
                 </div>
                 <div className="popup-time-col" style={{ height: totalScheduleHeight }}>
-                  {Array.from({ length: SCHED_END - SCHED_START + 1 }, (_, idx) => SCHED_START + idx).map((hour) => (
+                  {popupHours.map((hour) => (
                     <div
                       key={hour}
                       className="popup-time-lbl"
-                      style={{ top: (hour - SCHED_START) * SCHED_HOUR_H }}
+                      style={{ top: (hour - POPUP_START_H) * POPUP_HOUR_H }}
                     >
                       {hour < 12 ? `${hour}AM` : hour === 12 ? "12PM" : `${hour - 12}PM`}
                     </div>
@@ -1962,7 +3231,9 @@ function App() {
             { color: "dark", style: "#F09090" },
             { color: "light", style: "rgba(240,153,153,0.4)" },
             { color: "blue", style: "#99c4f0" },
-            { color: "green", style: "#99e0b4" }
+            { color: "blueLight", style: "rgba(153,196,240,0.38)" },
+            { color: "green", style: "#99e0b4" },
+            { color: "greenLight", style: "rgba(153,224,180,0.38)" }
           ] as const).map((colorItem) => (
             <button
               key={colorItem.color}
@@ -2021,7 +3292,9 @@ function App() {
               { color: "dark", style: "#F09090" },
               { color: "light", style: "rgba(240,153,153,0.4)" },
               { color: "blue", style: "#99c4f0" },
-              { color: "green", style: "#99e0b4" }
+              { color: "blueLight", style: "rgba(153,196,240,0.38)" },
+              { color: "green", style: "#99e0b4" },
+              { color: "greenLight", style: "rgba(153,224,180,0.38)" }
             ] as const).map((colorItem) => (
               <button
                 key={colorItem.color}
