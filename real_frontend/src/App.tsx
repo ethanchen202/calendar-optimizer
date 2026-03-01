@@ -7,8 +7,10 @@ import type {
 import { ApiClient } from "./api";
 import type {
   CalendarEvent as BackendCalendarEvent,
+  ChatDelta,
   EnergyInterval,
-  EnergyProfile
+  EnergyProfile,
+  UserState
 } from "./types";
 
 type ViewMode = "week" | "month" | "day" | "3days";
@@ -307,6 +309,17 @@ function getErrorMessage(error: unknown): string {
   return "Unexpected error";
 }
 
+function hasStructuralDeltaChanges(delta: ChatDelta): boolean {
+  return Boolean(
+    delta.tasks_add.length > 0 ||
+      delta.task_ids_remove.length > 0 ||
+      delta.task_title_contains_remove.length > 0 ||
+      delta.calendar_add.length > 0 ||
+      delta.calendar_ids_remove.length > 0 ||
+      delta.calendar_title_contains_remove.length > 0
+  );
+}
+
 function describeRecurrence(interval: EnergyInterval): string {
   const recurrence = interval.recurrence;
   if (recurrence.type === "daily") {
@@ -381,6 +394,11 @@ function App() {
       text: "Hi! I'm your scheduling assistant. Ask me anything about your calendar."
     }
   ]);
+  const [chatEmotions, setChatEmotions] = useState<string[]>([]);
+  const [pendingChatDelta, setPendingChatDelta] = useState<ChatDelta | null>(null);
+  const [pendingDeltaPreview, setPendingDeltaPreview] = useState<string[]>([]);
+  const [isAnalyzingChat, setIsAnalyzingChat] = useState(false);
+  const [isApplyingChatDelta, setIsApplyingChatDelta] = useState(false);
 
   const [energyTab, setEnergyTab] = useState<EnergyTab>("day");
   const [auraMode, setAuraMode] = useState(false);
@@ -561,25 +579,30 @@ function App() {
     return map;
   }, [events]);
 
+  function applyHydratedState(state: UserState) {
+    const mappedEvents = mapBackendEventsToUiEvents(state.calendar_events ?? []);
+    skipNextCalendarSyncRef.current = true;
+    setEvents(mappedEvents);
+    setNextId(mappedEvents.reduce((maxId, item) => Math.max(maxId, item.id), 0) + 1);
+    setEnergyProfile(state.energy_profile ?? EMPTY_ENERGY_PROFILE);
+
+    if (mappedEvents.length > 0) {
+      const firstDate = parseDateKey(mappedEvents[0].date);
+      if (firstDate) {
+        setCurDate(firstDate);
+        setWkStart(weekOf(firstDate));
+        setMthDate(new Date(firstDate.getFullYear(), firstDate.getMonth(), 1));
+      }
+    }
+  }
+
   async function refreshCalendarFromBackend() {
     setCalendarSyncState("loading");
     setCalendarSyncMessage("Loading calendar...");
     try {
       const state = await api.getUserState(userId);
+      applyHydratedState(state);
       const mappedEvents = mapBackendEventsToUiEvents(state.calendar_events ?? []);
-      setEnergyProfile(state.energy_profile ?? EMPTY_ENERGY_PROFILE);
-      skipNextCalendarSyncRef.current = true;
-      setEvents(mappedEvents);
-      setNextId(mappedEvents.reduce((maxId, item) => Math.max(maxId, item.id), 0) + 1);
-
-      if (mappedEvents.length > 0) {
-        const firstDate = parseDateKey(mappedEvents[0].date);
-        if (firstDate) {
-          setCurDate(firstDate);
-          setWkStart(weekOf(firstDate));
-          setMthDate(new Date(firstDate.getFullYear(), firstDate.getMonth(), 1));
-        }
-      }
       setCalendarSyncState("ready");
       setCalendarSyncMessage(
         `Loaded ${mappedEvents.length} event${mappedEvents.length === 1 ? "" : "s"} from backend.`
@@ -974,9 +997,9 @@ function App() {
     setEventEditor((current) => ({ ...current, open: false }));
   }
 
-  function sendChat() {
+  async function sendChat() {
     const message = chatInput.trim();
-    if (!message) {
+    if (!message || isAnalyzingChat || isApplyingChatDelta) {
       return;
     }
     const userMessageId = Date.now();
@@ -985,22 +1008,101 @@ function App() {
       { id: userMessageId, role: "user", text: message }
     ]);
     setChatInput("");
-    window.setTimeout(() => {
+    setIsAnalyzingChat(true);
+    try {
+      const response = await api.analyzeChat({
+        userId,
+        message,
+        timezone: DEFAULT_TIMEZONE,
+        useAI: true
+      });
       setChatMessages((current) => [
         ...current,
         {
           id: userMessageId + 1,
           role: "assistant",
-          text: "Thanks, I noted that."
+          text: response.assistant_message
         }
       ]);
-    }, 350);
+      setChatEmotions(response.detected_emotions ?? []);
+
+      if (response.updated_energy_profile) {
+        setEnergyProfile(response.updated_energy_profile);
+      }
+
+      if (response.requires_confirmation && hasStructuralDeltaChanges(response.proposed_delta)) {
+        setPendingChatDelta(response.proposed_delta);
+        setPendingDeltaPreview(response.delta_preview);
+      } else {
+        setPendingChatDelta(null);
+        setPendingDeltaPreview([]);
+      }
+    } catch (error) {
+      setChatMessages((current) => [
+        ...current,
+        {
+          id: userMessageId + 1,
+          role: "assistant",
+          text: `Unable to process message: ${getErrorMessage(error)}`
+        }
+      ]);
+    } finally {
+      setIsAnalyzingChat(false);
+    }
+  }
+
+  async function handleConfirmDelta() {
+    if (!pendingChatDelta || isApplyingChatDelta) {
+      return;
+    }
+    setIsApplyingChatDelta(true);
+    try {
+      const response = await api.applyChatDelta({
+        userId,
+        delta: pendingChatDelta
+      });
+      applyHydratedState(response.user_state);
+      setPendingChatDelta(null);
+      setPendingDeltaPreview([]);
+      setChatMessages((current) => [
+        ...current,
+        {
+          id: Date.now(),
+          role: "assistant",
+          text: "Applied confirmed changes."
+        }
+      ]);
+    } catch (error) {
+      setChatMessages((current) => [
+        ...current,
+        {
+          id: Date.now(),
+          role: "assistant",
+          text: `Failed to apply changes: ${getErrorMessage(error)}`
+        }
+      ]);
+    } finally {
+      setIsApplyingChatDelta(false);
+    }
+  }
+
+  function handleRejectDelta() {
+    setPendingChatDelta(null);
+    setPendingDeltaPreview([]);
+    setChatMessages((current) => [
+      ...current,
+      {
+        id: Date.now(),
+        role: "assistant",
+        text: "Discarded pending changes."
+      }
+    ]);
   }
 
   function onChatKeyDown(event: ReactKeyboardEvent<HTMLTextAreaElement>) {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
-      sendChat();
+      void sendChat();
     }
   }
 
@@ -1176,7 +1278,21 @@ function App() {
                     {message.text}
                   </div>
                 ))}
+                {isAnalyzingChat ? (
+                  <div className="chat-msg-ai">Analyzing...</div>
+                ) : null}
               </div>
+              {chatEmotions.length > 0 ? (
+                <div
+                  style={{
+                    margin: "0 14px 8px",
+                    fontSize: "11px",
+                    color: "#736f92"
+                  }}
+                >
+                  Detected emotions: {chatEmotions.join(", ")}
+                </div>
+              ) : null}
               <div className="chat-input-box">
                 <textarea
                   className="chat-textarea"
@@ -1191,8 +1307,10 @@ function App() {
                   <button
                     className="chat-btn chat-send aura-sphere"
                     type="button"
-                    onClick={sendChat}
-                    disabled={chatInput.trim().length === 0}
+                    onClick={() => {
+                      void sendChat();
+                    }}
+                    disabled={chatInput.trim().length === 0 || isAnalyzingChat || isApplyingChatDelta}
                     aria-label="Send chat message"
                     title="Send chat message"
                   >
@@ -1200,6 +1318,75 @@ function App() {
                   </button>
                 </div>
               </div>
+              {pendingChatDelta ? (
+                <div
+                  style={{
+                    margin: "0 14px 14px",
+                    padding: "10px 12px",
+                    borderRadius: "10px",
+                    border: "1px solid #d9d5ec",
+                    background: "rgba(255, 255, 255, 0.9)"
+                  }}
+                >
+                  <div style={{ fontSize: "12px", fontWeight: 600, color: "#524d73", marginBottom: "6px" }}>
+                    Confirm changes
+                  </div>
+                  {pendingDeltaPreview.length === 0 ? (
+                    <div style={{ fontSize: "12px", color: "#686389" }}>
+                      Changes were proposed, but preview is empty.
+                    </div>
+                  ) : (
+                    <ul
+                      style={{
+                        margin: 0,
+                        paddingLeft: "16px",
+                        fontSize: "12px",
+                        color: "#686389"
+                      }}
+                    >
+                      {pendingDeltaPreview.map((line) => (
+                        <li key={line}>{line}</li>
+                      ))}
+                    </ul>
+                  )}
+                  <div style={{ display: "flex", gap: "8px", marginTop: "8px" }}>
+                    <button
+                      type="button"
+                      disabled={isApplyingChatDelta}
+                      style={{
+                        border: "none",
+                        borderRadius: "8px",
+                        padding: "6px 10px",
+                        background: "#5f5aa4",
+                        color: "white",
+                        fontSize: "12px",
+                        cursor: isApplyingChatDelta ? "default" : "pointer"
+                      }}
+                      onClick={() => {
+                        void handleConfirmDelta();
+                      }}
+                    >
+                      {isApplyingChatDelta ? "Applying..." : "Confirm"}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={isApplyingChatDelta}
+                      style={{
+                        border: "1px solid #c9c4e2",
+                        borderRadius: "8px",
+                        padding: "6px 10px",
+                        background: "white",
+                        color: "#5f5aa4",
+                        fontSize: "12px",
+                        cursor: isApplyingChatDelta ? "default" : "pointer"
+                      }}
+                      onClick={handleRejectDelta}
+                    >
+                      Reject
+                    </button>
+                  </div>
+                </div>
+              ) : null}
             </>
           ) : (
             <div className="todo-list-wrap">
