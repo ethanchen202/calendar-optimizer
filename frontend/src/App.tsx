@@ -95,6 +95,10 @@ function App() {
     void checkBackendHealth();
   }, [api]);
 
+  useEffect(() => {
+    void warmupChatModel();
+  }, [api]);
+
   const clearMessages = () => {
     setStatusMessage("");
     setErrorMessage("");
@@ -134,6 +138,14 @@ function App() {
       );
     } catch {
       setBackendHealth("offline");
+    }
+  }
+
+  async function warmupChatModel() {
+    try {
+      await api.warmupChatAI();
+    } catch {
+      // Best-effort warmup only. Keep UI responsive if warmup fails.
     }
   }
 
@@ -899,4 +911,3 @@ function getErrorMessage(error: unknown): string {
 }
 
 export default App;
-

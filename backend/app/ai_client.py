@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import Any, Protocol
 from urllib import error, request
 
@@ -25,6 +26,9 @@ class SchedulerAIClient(Protocol):
         ...
 
     def extract_energy_profile_intervals(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        ...
+
+    def warm_up(self) -> bool:
         ...
 
 
@@ -81,6 +85,8 @@ class PromptDrivenSchedulerClient:
             "- If user asks for task/calendar changes, include only intended changes.\n"
             "- If user shares mood/energy constraints, convert them into energy_intervals_add.\n"
             "- Use hard_block true when user says they are unavailable, busy, in exam/class, or cannot work.\n"
+            "- Use `current_datetime` from the input JSON as the authoritative reference for relative dates.\n"
+            "- For words like today/tomorrow/next week, never invent a past year.\n"
             "- Do not include markdown.\n\n"
             f"Input JSON:\n{json.dumps(payload, indent=2, default=str)}"
         )
@@ -128,6 +134,13 @@ class PromptDrivenSchedulerClient:
         )
 
         return self._run_json_prompt(prompt, f"{self.provider_name} energy profile extraction failed.")
+
+    def warm_up(self) -> bool:
+        if not self.enabled:
+            return False
+        # Trigger one lightweight model call so first user interaction is less likely to pay cold-start costs.
+        content = self._invoke_prompt('Return JSON only: {"ready": true}')
+        return bool(content)
 
     def _run_json_prompt(self, prompt: str, error_log: str) -> dict[str, Any] | None:
         try:
@@ -217,6 +230,29 @@ class ModalVLLMSchedulerClient(PromptDrivenSchedulerClient):
     def enabled(self) -> bool:
         return bool(self._endpoint and self._model_name)
 
+    def warm_up(self) -> bool:
+        if not self.enabled:
+            return False
+
+        health_url = self._health_url
+        if health_url:
+            headers = {}
+            if self._api_key:
+                headers["Authorization"] = f"Bearer {self._api_key}"
+
+            deadline = time.monotonic() + max(15.0, min(self._timeout_seconds * 3.0, 180.0))
+            while True:
+                try:
+                    health_request = request.Request(url=health_url, headers=headers, method="GET")
+                    with request.urlopen(health_request, timeout=min(5.0, self._timeout_seconds)):
+                        break
+                except Exception:
+                    if time.monotonic() >= deadline:
+                        return False
+                    time.sleep(2.0)
+
+        return super().warm_up()
+
     def _invoke_prompt(self, prompt: str) -> str | None:
         if not self.enabled:
             return None
@@ -299,6 +335,22 @@ class ModalVLLMSchedulerClient(PromptDrivenSchedulerClient):
         if self._endpoint.endswith("/v1"):
             return f"{self._endpoint}/chat/completions"
         return f"{self._endpoint}/v1/chat/completions"
+
+    @property
+    def _health_url(self) -> str:
+        if not self._endpoint:
+            return ""
+        if self._endpoint.endswith("/v1/chat/completions"):
+            root = self._endpoint[: -len("/v1/chat/completions")]
+            return f"{root}/health"
+        if self._endpoint.endswith("/chat/completions"):
+            root = self._endpoint[: -len("/chat/completions")]
+            if root.endswith("/v1"):
+                root = root[: -len("/v1")]
+            return f"{root}/health"
+        if self._endpoint.endswith("/v1"):
+            return f"{self._endpoint[: -len('/v1')]}/health"
+        return f"{self._endpoint}/health"
 
 
 def _normalize_endpoint(endpoint: str | None) -> str | None:

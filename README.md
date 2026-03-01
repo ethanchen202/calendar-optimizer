@@ -155,6 +155,9 @@ Text update example:
 ### Analyze chatbot message
 `POST /api/v1/chat/analyze`
 
+### Warm up chat AI in background
+`POST /api/v1/chat/warmup`
+
 ### Apply confirmed chatbot delta
 `POST /api/v1/chat/apply-delta`
 

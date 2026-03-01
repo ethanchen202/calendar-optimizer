@@ -136,6 +136,26 @@ export class ApiClient {
     }>("/health");
   }
 
+  async warmupChatAI(): Promise<{
+    status: string;
+    provider: string;
+    started: boolean;
+    in_progress: boolean;
+    last_started_at: string | null;
+    last_completed_at: string | null;
+    last_error: string | null;
+  }> {
+    return this.request<{
+      status: string;
+      provider: string;
+      started: boolean;
+      in_progress: boolean;
+      last_started_at: string | null;
+      last_completed_at: string | null;
+      last_error: string | null;
+    }>("/api/v1/chat/warmup", { method: "POST" });
+  }
+
   private async request<T>(path: string, options: RequestOptions = {}): Promise<T> {
     const response = await fetch(`${this.baseUrl}${path}`, {
       method: options.method ?? "GET",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import logging
 import re
 from datetime import datetime, timedelta, timezone
@@ -38,9 +39,12 @@ def analyze_chat_message(
     use_ai: bool,
     ai_client: SchedulerAIClient,
 ) -> ChatAnalyzeResponse:
+    reference_now = datetime.now(_resolve_timezone(timezone_name))
     ai_payload = {
         "message": message,
         "timezone": timezone_name,
+        "current_datetime": reference_now.isoformat(),
+        "current_date": reference_now.date().isoformat(),
         "existing_tasks": user_state.get("tasks", []),
         "existing_calendar_events": user_state.get("calendar_events", []),
         "existing_energy_profile": user_state.get("energy_profile"),
@@ -80,7 +84,7 @@ def _coerce_chat_result(
         ai_assistant_message = str(ai_result.get("assistant_message") or "").strip()
         ai_emotions = _normalize_emotions(ai_result.get("detected_emotions", []))
         raw_delta = ai_result.get("delta")
-        delta_payload = raw_delta if isinstance(raw_delta, dict) else {}
+        delta_payload = _normalize_ai_delta_payload(raw_delta)
         try:
             candidate_delta = ChatDelta.model_validate(delta_payload)
             emotions = ai_emotions
@@ -94,6 +98,7 @@ def _coerce_chat_result(
                     emotions,
                     timezone_name=timezone_name,
                 )
+            _normalize_calendar_dates(candidate_delta, user_message, timezone_name)
             return {
                 "delta": candidate_delta,
                 "detected_emotions": emotions,
@@ -302,3 +307,204 @@ def _coerce_datetime(raw_value: str) -> str | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.isoformat()
+
+
+def _normalize_ai_delta_payload(raw_delta: object) -> dict[str, object]:
+    if not isinstance(raw_delta, dict):
+        return {}
+
+    delta_payload = deepcopy(raw_delta)
+    intervals = delta_payload.get("energy_intervals_add")
+    if isinstance(intervals, list):
+        normalized_intervals: list[object] = []
+        for interval in intervals:
+            if not isinstance(interval, dict):
+                continue
+            interval_payload = dict(interval)
+            interval_payload["recurrence"] = _normalize_recurrence_payload(interval_payload.get("recurrence"))
+            normalized_intervals.append(interval_payload)
+        delta_payload["energy_intervals_add"] = normalized_intervals
+    return delta_payload
+
+
+def _normalize_recurrence_payload(raw_recurrence: object) -> dict[str, object]:
+    if not isinstance(raw_recurrence, dict):
+        return {"type": "daily"}
+
+    recurrence = dict(raw_recurrence)
+    requested_type = str(recurrence.get("type") or "").strip().lower()
+
+    if requested_type == "daily":
+        return {"type": "daily"}
+    if requested_type == "weekly":
+        days = _extract_days_of_week(recurrence)
+        return {"type": "weekly", "days_of_week": days} if days else {"type": "daily"}
+    if requested_type == "specific_date":
+        date_value = _coerce_date_value(recurrence.get("date"))
+        return {"type": "specific_date", "date": date_value} if date_value is not None else {"type": "daily"}
+    if requested_type == "date_range":
+        start_date = _coerce_date_value(recurrence.get("start_date"))
+        end_date = _coerce_date_value(recurrence.get("end_date"))
+        if start_date is not None and end_date is not None:
+            normalized: dict[str, object] = {
+                "type": "date_range",
+                "start_date": start_date,
+                "end_date": end_date,
+            }
+            days = _extract_days_of_week(recurrence)
+            if days:
+                normalized["days_of_week"] = days
+            return normalized
+    if requested_type == "monthly_nth_weekday":
+        week_of_month = _coerce_int_in_range(recurrence.get("week_of_month"), 1, 5)
+        weekday = _coerce_int_in_range(recurrence.get("weekday"), 0, 6)
+        if week_of_month is not None and weekday is not None:
+            return {
+                "type": "monthly_nth_weekday",
+                "week_of_month": week_of_month,
+                "weekday": weekday,
+            }
+    if requested_type == "monthly_weekdays":
+        week_of_month = _coerce_int_in_range(recurrence.get("week_of_month"), 1, 5)
+        if week_of_month is not None:
+            normalized = {
+                "type": "monthly_weekdays",
+                "week_of_month": week_of_month,
+            }
+            days = _extract_days_of_week(recurrence)
+            if days:
+                normalized["days_of_week"] = days
+            return normalized
+
+    # Fallback inference for malformed/unknown recurrence payloads.
+    start_date = _coerce_date_value(recurrence.get("start_date"))
+    end_date = _coerce_date_value(recurrence.get("end_date"))
+    if start_date is not None and end_date is not None:
+        normalized = {
+            "type": "date_range",
+            "start_date": start_date,
+            "end_date": end_date,
+        }
+        days = _extract_days_of_week(recurrence)
+        if days:
+            normalized["days_of_week"] = days
+        return normalized
+
+    date_value = _coerce_date_value(recurrence.get("date"))
+    if date_value is not None:
+        return {"type": "specific_date", "date": date_value}
+
+    week_of_month = _coerce_int_in_range(recurrence.get("week_of_month"), 1, 5)
+    weekday = _coerce_int_in_range(recurrence.get("weekday"), 0, 6)
+    if week_of_month is not None and weekday is not None:
+        return {
+            "type": "monthly_nth_weekday",
+            "week_of_month": week_of_month,
+            "weekday": weekday,
+        }
+    if week_of_month is not None:
+        normalized = {"type": "monthly_weekdays", "week_of_month": week_of_month}
+        days = _extract_days_of_week(recurrence)
+        if days:
+            normalized["days_of_week"] = days
+        return normalized
+
+    days = _extract_days_of_week(recurrence)
+    if days:
+        return {"type": "weekly", "days_of_week": days}
+    return {"type": "daily"}
+
+
+def _extract_days_of_week(recurrence: dict[str, object]) -> list[int]:
+    days: list[int] = []
+    raw_days = recurrence.get("days_of_week")
+    if isinstance(raw_days, list):
+        for raw_day in raw_days:
+            day = _coerce_int_in_range(raw_day, 0, 6)
+            if day is not None and day not in days:
+                days.append(day)
+    if not days:
+        weekday = _coerce_int_in_range(recurrence.get("weekday"), 0, 6)
+        if weekday is not None:
+            days.append(weekday)
+    return days
+
+
+def _coerce_int_in_range(raw_value: object, minimum: int, maximum: int) -> int | None:
+    try:
+        value = int(raw_value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if value < minimum or value > maximum:
+        return None
+    return value
+
+
+def _coerce_date_value(raw_value: object) -> object | None:
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, str):
+        value = raw_value.strip()
+        if not value or value.lower() in {"none", "null"}:
+            return None
+        return value
+    return raw_value
+
+
+def _normalize_calendar_dates(delta: ChatDelta, user_message: str, timezone_name: str) -> None:
+    if not delta.calendar_add:
+        return
+
+    lowered_message = user_message.lower()
+    tz = _resolve_timezone(timezone_name)
+    now_local = datetime.now(tz)
+    relative_day_offset: int | None = None
+    if "tomorrow" in lowered_message:
+        relative_day_offset = 1
+    elif "today" in lowered_message:
+        relative_day_offset = 0
+    elif "yesterday" in lowered_message:
+        relative_day_offset = -1
+
+    target_date = now_local.date() + timedelta(days=relative_day_offset) if relative_day_offset is not None else None
+    current_year = now_local.year
+
+    for event in delta.calendar_add:
+        original_start = _to_timezone(event.start, tz)
+        original_end = _to_timezone(event.end, tz)
+        duration = original_end - original_start
+        if duration.total_seconds() <= 0:
+            duration = timedelta(minutes=60)
+
+        if target_date is not None:
+            corrected_start = datetime.combine(target_date, original_start.time(), tzinfo=tz)
+            event.start = corrected_start
+            event.end = corrected_start + duration
+            continue
+
+        # Guard against obvious model year drift (e.g., 2023 when current year is 2026).
+        if abs(original_start.year - current_year) >= 2:
+            corrected_start = _replace_year_safely(original_start, current_year)
+            if corrected_start is None:
+                continue
+            event.start = corrected_start
+            event.end = corrected_start + duration
+
+
+def _to_timezone(value: datetime, tz: ZoneInfo) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=tz)
+    return value.astimezone(tz)
+
+
+def _replace_year_safely(value: datetime, new_year: int) -> datetime | None:
+    try:
+        return value.replace(year=new_year)
+    except ValueError:
+        if value.month == 2 and value.day == 29:
+            for fallback_day in (28, 27):
+                try:
+                    return value.replace(year=new_year, day=fallback_day)
+                except ValueError:
+                    continue
+    return None

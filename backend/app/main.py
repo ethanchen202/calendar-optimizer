@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import threading
+from datetime import datetime, timezone
+from typing import Any
+
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -61,6 +65,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+_chat_warmup_lock = threading.Lock()
+_chat_warmup_state: dict[str, Any] = {
+    "in_progress": False,
+    "last_started_at": None,
+    "last_completed_at": None,
+    "last_error": None,
+}
+
 
 @app.get("/health")
 def health() -> dict[str, str]:
@@ -69,6 +81,23 @@ def health() -> dict[str, str]:
         "chat_ai_provider": ai_client.provider_name if ai_client.enabled else "heuristic-fallback",
         "chat_ai_configured_provider": settings.ai_provider,
         "scheduler_strategy": "heuristic-only",
+    }
+
+
+@app.on_event("startup")
+def warmup_chat_ai_on_startup() -> None:
+    _start_chat_ai_warmup()
+
+
+@app.post("/api/v1/chat/warmup")
+def warmup_chat_ai() -> dict[str, Any]:
+    started = _start_chat_ai_warmup()
+    state = _chat_warmup_snapshot()
+    return {
+        "status": "ok",
+        "provider": ai_client.provider_name if ai_client.enabled else "heuristic-fallback",
+        "started": started,
+        **state,
     }
 
 
@@ -307,3 +336,42 @@ def _hydrate_state(user_id: str) -> UserStateResponse:
         energy_profile=coerce_energy_profile(state.get("energy_profile")),
         checkins=[CheckinRecord.model_validate(checkin) for checkin in state.get("checkins", [])],
     )
+
+
+def _chat_warmup_snapshot() -> dict[str, Any]:
+    with _chat_warmup_lock:
+        return {
+            "in_progress": bool(_chat_warmup_state["in_progress"]),
+            "last_started_at": _chat_warmup_state["last_started_at"],
+            "last_completed_at": _chat_warmup_state["last_completed_at"],
+            "last_error": _chat_warmup_state["last_error"],
+        }
+
+
+def _start_chat_ai_warmup() -> bool:
+    if not ai_client.enabled:
+        return False
+
+    with _chat_warmup_lock:
+        if _chat_warmup_state["in_progress"]:
+            return False
+        _chat_warmup_state["in_progress"] = True
+        _chat_warmup_state["last_started_at"] = datetime.now(timezone.utc).isoformat()
+        _chat_warmup_state["last_error"] = None
+
+    threading.Thread(target=_run_chat_ai_warmup, daemon=True).start()
+    return True
+
+
+def _run_chat_ai_warmup() -> None:
+    error_message: str | None = None
+    try:
+        if not ai_client.warm_up():
+            error_message = "Warm-up request did not complete successfully."
+    except Exception as exc:  # pragma: no cover - defensive logging path.
+        error_message = str(exc)
+    finally:
+        with _chat_warmup_lock:
+            _chat_warmup_state["in_progress"] = False
+            _chat_warmup_state["last_completed_at"] = datetime.now(timezone.utc).isoformat()
+            _chat_warmup_state["last_error"] = error_message
