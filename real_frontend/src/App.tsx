@@ -4,6 +4,12 @@ import type {
   MouseEvent as ReactMouseEvent,
   WheelEvent as ReactWheelEvent
 } from "react";
+import { ApiClient } from "./api";
+import type {
+  CalendarEvent as BackendCalendarEvent,
+  EnergyInterval,
+  EnergyProfile
+} from "./types";
 
 type ViewMode = "week" | "month" | "day" | "3days";
 type TopTab = "calendar" | "insights";
@@ -13,6 +19,7 @@ type ColorClass = "dark" | "light" | "blue" | "green";
 
 type EventItem = {
   id: number;
+  backendId?: string;
   date: string;
   sh: number;
   eh: number;
@@ -63,7 +70,9 @@ type DragState = {
   moved: boolean;
 };
 
-const TODAY = new Date(2026, 1, 3);
+const DEFAULT_API_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
+const DEFAULT_USER_ID = "user_123";
+const TODAY = new Date();
 const DAYS_FULL = ["Mon", "Tue", "Wed", "Thur", "Fri", "Sat", "Sun"];
 const MONTHS = [
   "January",
@@ -81,17 +90,16 @@ const MONTHS = [
 ];
 const HOUR_H = 84;
 const START_H = 7;
-
-const INITIAL_EVENTS: EventItem[] = [
-  { id: 1, date: "2026-02-03", sh: 9, eh: 10, title: "ADV250", c: "dark", done: false },
-  { id: 2, date: "2026-02-03", sh: 10, eh: 11.5, title: "Studying", c: "light", done: false },
-  { id: 3, date: "2026-02-03", sh: 11.5, eh: 12.25, title: "Brunch", c: "light", done: false },
-  { id: 4, date: "2026-02-03", sh: 12, eh: 13.67, title: "MATH257", c: "dark", done: false },
-  { id: 5, date: "2026-02-03", sh: 14, eh: 15.5, title: "Studying for CS173", c: "light", done: false },
-  { id: 6, date: "2026-02-03", sh: 15.5, eh: 16.25, title: "Client Call", c: "dark", done: false },
-  { id: 7, date: "2026-02-03", sh: 16.5, eh: 17.25, title: "Dinner", c: "light", done: false },
-  { id: 8, date: "2026-02-04", sh: 11, eh: 12, title: "Client Call", c: "dark", done: false }
-];
+const COLOR_ORDER: ColorClass[] = ["dark", "light", "blue", "green"];
+const WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const DEFAULT_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+const EMPTY_ENERGY_PROFILE: EnergyProfile = {
+  version: 1,
+  timezone: DEFAULT_TIMEZONE,
+  intervals: [],
+  freeform_notes: null,
+  updated_at: null
+};
 
 const SCHEDULE = [
   { title: "ADV250", sh: 9, eh: 10, c: "dark", emoji: "😴" },
@@ -139,6 +147,104 @@ function fmtTime(hourFloat: number): string {
 function parseTime(value: string): number {
   const [h, m] = value.split(":").map(Number);
   return h + m / 60;
+}
+
+function fromIsoToHour(date: Date): number {
+  return date.getHours() + date.getMinutes() / 60;
+}
+
+function parseDateKey(dateKey: string): Date | null {
+  const [yearStr, monthStr, dayStr] = dateKey.split("-");
+  const year = Number.parseInt(yearStr ?? "", 10);
+  const month = Number.parseInt(monthStr ?? "", 10);
+  const day = Number.parseInt(dayStr ?? "", 10);
+  if (
+    Number.isNaN(year) ||
+    Number.isNaN(month) ||
+    Number.isNaN(day) ||
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > 31
+  ) {
+    return null;
+  }
+  return new Date(year, month - 1, day);
+}
+
+function buildLocalDateTime(dateKey: string, hourFloat: number): Date | null {
+  const baseDate = parseDateKey(dateKey);
+  if (!baseDate || Number.isNaN(hourFloat)) {
+    return null;
+  }
+  const totalMinutes = Math.max(0, Math.round(hourFloat * 60));
+  const hour = Math.floor(totalMinutes / 60);
+  const minute = totalMinutes % 60;
+  baseDate.setHours(hour, minute, 0, 0);
+  return baseDate;
+}
+
+function eventColorFromSeed(seed: string): ColorClass {
+  let hash = 0;
+  for (let i = 0; i < seed.length; i += 1) {
+    hash = (hash * 31 + seed.charCodeAt(i)) | 0;
+  }
+  return COLOR_ORDER[Math.abs(hash) % COLOR_ORDER.length];
+}
+
+function mapBackendEventsToUiEvents(calendarEvents: BackendCalendarEvent[]): EventItem[] {
+  const sorted = [...calendarEvents].sort((a, b) => {
+    const aTs = new Date(a.start).getTime();
+    const bTs = new Date(b.start).getTime();
+    return aTs - bTs;
+  });
+
+  const mapped: EventItem[] = [];
+  let localId = 1;
+  for (const item of sorted) {
+    const start = new Date(item.start);
+    const end = new Date(item.end);
+    if (
+      Number.isNaN(start.getTime()) ||
+      Number.isNaN(end.getTime()) ||
+      end.getTime() <= start.getTime()
+    ) {
+      continue;
+    }
+
+    const sh = fromIsoToHour(start);
+    const eh = Math.max(fromIsoToHour(end), sh + 0.25);
+    const seed = item.id && item.id.trim() ? item.id : `${item.title}-${item.start}`;
+    mapped.push({
+      id: localId,
+      backendId: item.id ?? `calendar_${localId}`,
+      date: fmtDate(start),
+      sh,
+      eh,
+      title: item.title,
+      c: eventColorFromSeed(seed),
+      done: false
+    });
+    localId += 1;
+  }
+  return mapped;
+}
+
+function mapUiEventsToBackendEvents(events: EventItem[]): BackendCalendarEvent[] {
+  return events.reduce<BackendCalendarEvent[]>((result, item) => {
+    const start = buildLocalDateTime(item.date, item.sh);
+    const end = buildLocalDateTime(item.date, Math.max(item.eh, item.sh + 0.25));
+    if (!start || !end || end <= start) {
+      return result;
+    }
+    result.push({
+      id: item.backendId ?? `calendar_${item.id}`,
+      title: item.title,
+      start: start.toISOString(),
+      end: end.toISOString()
+    });
+    return result;
+  }, []);
 }
 
 function snapQuarter(hour: number): number {
@@ -194,24 +300,80 @@ function buildPeriodTitle(view: ViewMode, weekStart: Date, currentDate: Date, mo
   return `${MONTHS[monthDate.getMonth()]} ${monthDate.getFullYear()}`;
 }
 
+function getErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return "Unexpected error";
+}
+
+function describeRecurrence(interval: EnergyInterval): string {
+  const recurrence = interval.recurrence;
+  if (recurrence.type === "daily") {
+    return "Daily";
+  }
+  if (recurrence.type === "weekly") {
+    const days = (recurrence.days_of_week ?? [])
+      .map((day) => WEEKDAY_NAMES[day] ?? `${day}`)
+      .join(", ");
+    return days ? `Weekly (${days})` : "Weekly";
+  }
+  if (recurrence.type === "specific_date") {
+    return recurrence.date ? `On ${recurrence.date}` : "Specific date";
+  }
+  if (recurrence.type === "date_range") {
+    const from = recurrence.start_date ?? "?";
+    const to = recurrence.end_date ?? "?";
+    if ((recurrence.days_of_week ?? []).length > 0) {
+      const days = (recurrence.days_of_week ?? [])
+        .map((day) => WEEKDAY_NAMES[day] ?? `${day}`)
+        .join(", ");
+      return `${from} to ${to} (${days})`;
+    }
+    return `${from} to ${to}`;
+  }
+  if (recurrence.type === "monthly_nth_weekday") {
+    const week = recurrence.week_of_month ?? "?";
+    const weekday =
+      recurrence.weekday !== null && recurrence.weekday !== undefined
+        ? (WEEKDAY_NAMES[recurrence.weekday] ?? `${recurrence.weekday}`)
+        : "?";
+    return `Monthly: week ${week}, ${weekday}`;
+  }
+  const week = recurrence.week_of_month ?? "?";
+  const days = (recurrence.days_of_week ?? [])
+    .map((day) => WEEKDAY_NAMES[day] ?? `${day}`)
+    .join(", ");
+  return days ? `Monthly week ${week} (${days})` : `Monthly week ${week}`;
+}
+
+function describeEnergyInterval(interval: EnergyInterval): string {
+  const level = interval.energy_level > 0 ? `+${interval.energy_level}` : `${interval.energy_level}`;
+  const blockText = interval.hard_block ? "Hard block" : `Energy ${level}`;
+  const label = interval.label?.trim() ? interval.label.trim() : interval.id;
+  return `${label}: ${interval.start_time}-${interval.end_time} | ${blockText} | ${describeRecurrence(interval)}`;
+}
+
 function App() {
+  const api = useMemo(() => new ApiClient(DEFAULT_API_URL), []);
+  const userId = DEFAULT_USER_ID;
+
   const [activeTab, setActiveTab] = useState<TopTab>("calendar");
   const [sidebarMode, setSidebarMode] = useState<SidebarMode>("chat");
   const [curView, setCurView] = useState<ViewMode>("week");
   const [curDate, setCurDate] = useState<Date>(new Date(TODAY));
   const [wkStart, setWkStart] = useState<Date>(weekOf(new Date(TODAY)));
-  const [mthDate, setMthDate] = useState<Date>(new Date(2026, 1, 1));
-  const [events, setEvents] = useState<EventItem[]>(INITIAL_EVENTS);
-  const [nextId, setNextId] = useState(50);
+  const [mthDate, setMthDate] = useState<Date>(new Date(TODAY.getFullYear(), TODAY.getMonth(), 1));
+  const [events, setEvents] = useState<EventItem[]>([]);
+  const [nextId, setNextId] = useState(1);
+  const [calendarReady, setCalendarReady] = useState(false);
+  const [calendarSyncState, setCalendarSyncState] = useState<"loading" | "ready" | "syncing" | "error">("loading");
+  const [calendarSyncMessage, setCalendarSyncMessage] = useState("Loading calendar...");
+  const [energyProfile, setEnergyProfile] = useState<EnergyProfile>(EMPTY_ENERGY_PROFILE);
+  const [energySaveState, setEnergySaveState] = useState<"idle" | "saving" | "success" | "error">("idle");
 
   const [chatInput, setChatInput] = useState("");
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
-    {
-      id: 1,
-      role: "assistant",
-      text: "Let me know what you have today, I can make a personalized schedule."
-    }
-  ]);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
 
   const [energyTab, setEnergyTab] = useState<EnergyTab>("day");
   const [auraMode, setAuraMode] = useState(false);
@@ -252,6 +414,7 @@ function App() {
   const timeScrollRef = useRef<HTMLDivElement | null>(null);
   const eventPopupRef = useRef<HTMLDivElement | null>(null);
   const dayInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const skipNextCalendarSyncRef = useRef(true);
 
   const periodTitle = useMemo(
     () => buildPeriodTitle(curView, wkStart, curDate, mthDate),
@@ -391,6 +554,69 @@ function App() {
     return map;
   }, [events]);
 
+  async function refreshCalendarFromBackend() {
+    setCalendarSyncState("loading");
+    setCalendarSyncMessage("Loading calendar...");
+    try {
+      const state = await api.getUserState(userId);
+      const mappedEvents = mapBackendEventsToUiEvents(state.calendar_events ?? []);
+      setEnergyProfile(state.energy_profile ?? EMPTY_ENERGY_PROFILE);
+      skipNextCalendarSyncRef.current = true;
+      setEvents(mappedEvents);
+      setNextId(mappedEvents.reduce((maxId, item) => Math.max(maxId, item.id), 0) + 1);
+
+      if (mappedEvents.length > 0) {
+        const firstDate = parseDateKey(mappedEvents[0].date);
+        if (firstDate) {
+          setCurDate(firstDate);
+          setWkStart(weekOf(firstDate));
+          setMthDate(new Date(firstDate.getFullYear(), firstDate.getMonth(), 1));
+        }
+      }
+      setCalendarSyncState("ready");
+      setCalendarSyncMessage(
+        `Loaded ${mappedEvents.length} event${mappedEvents.length === 1 ? "" : "s"} from backend.`
+      );
+    } catch (error) {
+      setCalendarSyncState("error");
+      setCalendarSyncMessage(`Failed to load calendar: ${getErrorMessage(error)}`);
+    } finally {
+      setCalendarReady(true);
+    }
+  }
+
+  async function syncCalendarToBackend(nextEvents: EventItem[]) {
+    try {
+      setCalendarSyncState("syncing");
+      setCalendarSyncMessage("Saving calendar...");
+      const payload = mapUiEventsToBackendEvents(nextEvents);
+      await api.syncCalendar(userId, payload);
+      setCalendarSyncState("ready");
+      setCalendarSyncMessage(`Synced ${payload.length} event${payload.length === 1 ? "" : "s"}.`);
+    } catch (error) {
+      setCalendarSyncState("error");
+      setCalendarSyncMessage(`Calendar sync failed: ${getErrorMessage(error)}`);
+    }
+  }
+
+  useEffect(() => {
+    void refreshCalendarFromBackend();
+  }, [api]);
+
+  useEffect(() => {
+    if (!calendarReady) {
+      return;
+    }
+    if (skipNextCalendarSyncRef.current) {
+      skipNextCalendarSyncRef.current = false;
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      void syncCalendarToBackend(events);
+    }, 350);
+    return () => window.clearTimeout(timer);
+  }, [calendarReady, events]);
+
   useEffect(() => {
     if (!timeScrollRef.current || curView === "month") {
       return;
@@ -399,19 +625,19 @@ function App() {
   }, [curView, wkStart, curDate, gridAnimNonce]);
 
   useEffect(() => {
-    if (!chatAreaRef.current) {
-      return;
-    }
-    chatAreaRef.current.scrollTop = chatAreaRef.current.scrollHeight;
-  }, [chatMessages]);
-
-  useEffect(() => {
     if (!overlayOpen || !dayInputRef.current) {
       return;
     }
     const timer = window.setTimeout(() => dayInputRef.current?.focus(), 250);
     return () => window.clearTimeout(timer);
   }, [overlayOpen]);
+
+  useEffect(() => {
+    if (!chatAreaRef.current) {
+      return;
+    }
+    chatAreaRef.current.scrollTop = chatAreaRef.current.scrollHeight;
+  }, [chatMessages, energySaveState]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -625,8 +851,12 @@ function App() {
     }
     const sh = parseTime(eventPopup.start);
     const eh = parseTime(eventPopup.end);
+    if (Number.isNaN(sh) || Number.isNaN(eh)) {
+      return;
+    }
     const nextEvent: EventItem = {
       id: nextId,
+      backendId: `calendar_${Date.now()}_${nextId}`,
       date: eventPopup.date,
       sh,
       eh: Math.max(eh, sh + 0.25),
@@ -715,30 +945,43 @@ function App() {
     setEventEditor((current) => ({ ...current, open: false }));
   }
 
-  function sendChat() {
-    const message = chatInput.trim();
-    if (!message) {
+  async function submitEnergyProfileInput() {
+    const description = chatInput.trim();
+    if (!description || energySaveState === "saving") {
       return;
     }
-    const id = Date.now();
-    setChatMessages((current) => [...current, { id, role: "user", text: message }]);
+    const userMessageId = Date.now();
+    setChatMessages((current) => [
+      ...current,
+      { id: userMessageId, role: "user", text: description }
+    ]);
     setChatInput("");
-    window.setTimeout(() => {
+    setEnergySaveState("saving");
+    try {
+      await api.updateEnergyProfile(userId, description);
+      await refreshCalendarFromBackend();
+      setEnergySaveState("success");
+      setChatMessages((current) => [
+        ...current,
+        { id: userMessageId + 1, role: "assistant", text: "Energy profile updated" }
+      ]);
+    } catch (error) {
+      setEnergySaveState("error");
       setChatMessages((current) => [
         ...current,
         {
-          id: id + 1,
+          id: userMessageId + 1,
           role: "assistant",
-          text: "I've noted that. Keep logging your days to build your Aura profile!"
+          text: `Update failed: ${getErrorMessage(error)}`
         }
       ]);
-    }, 800);
+    }
   }
 
   function onChatKeyDown(event: ReactKeyboardEvent<HTMLTextAreaElement>) {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
-      sendChat();
+      void submitEnergyProfileInput();
     }
   }
 
@@ -834,7 +1077,7 @@ function App() {
       <div className={`body-wrap ${activeTab === "calendar" ? "" : "hidden"}`} id="view-calendar">
         <aside className="sidebar">
           <div className="todo-bar">
-            <span className="todo-mode-label">{sidebarMode === "chat" ? "Chat" : "To-Do List"}</span>
+            <span className="todo-mode-label">{sidebarMode === "chat" ? "Energy Input" : "To-Do List"}</span>
             <span className="todo-chevron">▾</span>
             <select
               className="todo-select"
@@ -843,8 +1086,64 @@ function App() {
               aria-label="Sidebar mode"
             >
               <option value="todo">To-Do List</option>
-              <option value="chat">Chat</option>
+              <option value="chat">Energy Input</option>
             </select>
+          </div>
+          <div
+            style={{
+              margin: "8px 12px 12px",
+              padding: "8px 10px",
+              borderRadius: "10px",
+              background: "rgba(255, 255, 255, 0.68)",
+              border: "1px solid rgba(0, 0, 0, 0.07)"
+            }}
+          >
+            <div
+              style={{
+                fontSize: "12px",
+                fontWeight: 600,
+                color: calendarSyncState === "error" ? "#B42318" : "#4E4A67"
+              }}
+            >
+              {calendarSyncState === "loading"
+                ? "Connecting backend..."
+                : calendarSyncState === "syncing"
+                  ? "Saving calendar..."
+                  : calendarSyncState === "error"
+                    ? "Backend sync failed"
+                    : "Backend connected"}
+            </div>
+            <div
+              style={{
+                marginTop: "4px",
+                fontSize: "11px",
+                color: "rgba(68, 62, 96, 0.82)",
+                whiteSpace: "nowrap",
+                overflow: "hidden",
+                textOverflow: "ellipsis"
+              }}
+              title={calendarSyncMessage}
+            >
+              {calendarSyncMessage}
+            </div>
+            <button
+              type="button"
+              style={{
+                marginTop: "6px",
+                border: "none",
+                background: "transparent",
+                color: "#5F5AA4",
+                fontSize: "11px",
+                fontWeight: 600,
+                cursor: "pointer",
+                padding: 0
+              }}
+              onClick={() => {
+                void refreshCalendarFromBackend();
+              }}
+            >
+              Reload from backend
+            </button>
           </div>
 
           {sidebarMode === "chat" ? (
@@ -858,21 +1157,41 @@ function App() {
                     {message.text}
                   </div>
                 ))}
+                {energySaveState === "saving" ? (
+                  <div className="chat-msg-ai">Updating energy profile...</div>
+                ) : null}
               </div>
               <div className="chat-input-box">
                 <textarea
                   className="chat-textarea"
-                  placeholder="Type anything..."
+                  placeholder="Describe your energy patterns..."
                   rows={2}
                   value={chatInput}
                   onChange={(event) => setChatInput(event.target.value)}
                   onKeyDown={onChatKeyDown}
                 />
                 <div className="chat-input-btns">
-                  <button className="chat-btn chat-mic" type="button">
-                    🎤
+                  <button
+                    className="chat-btn chat-mic"
+                    type="button"
+                    onClick={() => {
+                      void refreshCalendarFromBackend();
+                    }}
+                    aria-label="Reload energy profile"
+                    title="Reload energy profile"
+                  >
+                    ↺
                   </button>
-                  <button className="chat-btn chat-send aura-sphere" type="button" onClick={sendChat}>
+                  <button
+                    className="chat-btn chat-send aura-sphere"
+                    type="button"
+                    onClick={() => {
+                      void submitEnergyProfileInput();
+                    }}
+                    disabled={energySaveState === "saving" || chatInput.trim().length === 0}
+                    aria-label="Save energy profile text"
+                    title="Save energy profile text"
+                  >
                     ↑
                   </button>
                 </div>
@@ -1148,10 +1467,24 @@ function App() {
         <div className="insights-wrap">
           <div className="i-card">
             <div className="i-card-title">AI Profile</div>
-            <div className="i-row">You perform better when studying a week in advance</div>
-            <div className="i-row">You perform 23% worse when you study the night before.</div>
-            <div className="i-row">Best performance when final session is 36 hours prior.</div>
-            <div className="i-load">Load more...</div>
+            <div className="i-row">Timezone: {energyProfile.timezone}</div>
+            <div className="i-row">Intervals detected: {energyProfile.intervals.length}</div>
+            {energyProfile.intervals.length === 0 ? (
+              <div className="i-row">
+                No energy intervals yet. Use the Energy Input sidebar to add patterns.
+              </div>
+            ) : (
+              energyProfile.intervals.map((interval) => (
+                <div key={interval.id} className="i-row">
+                  {describeEnergyInterval(interval)}
+                </div>
+              ))
+            )}
+            {energyProfile.freeform_notes?.trim() ? (
+              <div className="i-row">
+                Notes: {energyProfile.freeform_notes.trim()}
+              </div>
+            ) : null}
           </div>
 
           <div className="i-card">
