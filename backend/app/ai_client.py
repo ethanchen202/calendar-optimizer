@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class GeminiSchedulerClient:
@@ -51,6 +54,7 @@ class GeminiSchedulerClient:
                 return None
             return self._extract_json(content)
         except Exception:
+            logger.exception("Gemini schedule generation failed.")
             return None
 
     def analyze_chat_delta(self, payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -92,6 +96,7 @@ class GeminiSchedulerClient:
                 return None
             return self._extract_json(content)
         except Exception:
+            logger.exception("Gemini chat analysis failed.")
             return None
 
     def extract_energy_profile_intervals(self, payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -141,6 +146,7 @@ class GeminiSchedulerClient:
                 return None
             return self._extract_json(content)
         except Exception:
+            logger.exception("Gemini energy profile extraction failed.")
             return None
 
     def _extract_json(self, text: str) -> dict[str, Any] | None:

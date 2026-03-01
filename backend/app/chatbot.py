@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -25,6 +26,8 @@ EMOTION_ENERGY_LEVEL = {
     "frustrated": -2,
     "sad": -2,
 }
+
+logger = logging.getLogger(__name__)
 
 
 def analyze_chat_message(
@@ -71,15 +74,17 @@ def _coerce_chat_result(
     gemini_client: GeminiSchedulerClient,
     user_state: dict[str, object],
 ) -> dict[str, object]:
+    ai_assistant_message = ""
+    ai_emotions: list[str] = []
     if ai_result:
+        ai_assistant_message = str(ai_result.get("assistant_message") or "").strip()
+        ai_emotions = _normalize_emotions(ai_result.get("detected_emotions", []))
+        raw_delta = ai_result.get("delta")
+        delta_payload = raw_delta if isinstance(raw_delta, dict) else {}
         try:
-            candidate_delta = ChatDelta.model_validate(ai_result.get("delta", {}))
-            emotions = [
-                str(item).strip().lower()
-                for item in ai_result.get("detected_emotions", [])
-                if str(item).strip()
-            ]
-            assistant_message = str(ai_result.get("assistant_message") or "").strip()
+            candidate_delta = ChatDelta.model_validate(delta_payload)
+            emotions = ai_emotions
+            assistant_message = ai_assistant_message
             if not assistant_message:
                 assistant_message = _default_assistant_reply(candidate_delta)
             if not emotions:
@@ -95,10 +100,10 @@ def _coerce_chat_result(
                 "assistant_message": assistant_message,
             }
         except Exception:
-            pass
+            logger.exception("Unable to validate AI chat delta. Falling back to heuristic parser.")
 
     fallback_delta = _fallback_delta(user_message, timezone_name, gemini_client, user_state)
-    fallback_emotions = _detect_emotions(user_message)
+    fallback_emotions = ai_emotions or _detect_emotions(user_message)
     if not fallback_delta.energy_intervals_add and not fallback_delta.energy_interval_ids_remove:
         fallback_delta.energy_intervals_add = _energy_intervals_from_emotions(
             fallback_emotions,
@@ -107,7 +112,7 @@ def _coerce_chat_result(
     return {
         "delta": fallback_delta,
         "detected_emotions": fallback_emotions,
-        "assistant_message": _default_assistant_reply(fallback_delta),
+        "assistant_message": ai_assistant_message or _default_assistant_reply(fallback_delta),
     }
 
 
@@ -127,6 +132,16 @@ def _detect_emotions(message: str) -> list[str]:
         if any(keyword in lowered for keyword in keywords):
             detected.append(emotion)
     return detected
+
+
+def _normalize_emotions(raw_value: object) -> list[str]:
+    if isinstance(raw_value, str):
+        candidates = [raw_value]
+    elif isinstance(raw_value, (list, tuple, set)):
+        candidates = list(raw_value)
+    else:
+        candidates = []
+    return [str(item).strip().lower() for item in candidates if str(item).strip()]
 
 
 def _energy_intervals_from_emotions(emotions: list[str], timezone_name: str) -> list[EnergyInterval]:
@@ -287,4 +302,3 @@ def _coerce_datetime(raw_value: str) -> str | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.isoformat()
-
