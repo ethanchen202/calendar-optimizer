@@ -371,9 +371,16 @@ function App() {
   const [calendarSyncMessage, setCalendarSyncMessage] = useState("Loading calendar...");
   const [energyProfile, setEnergyProfile] = useState<EnergyProfile>(EMPTY_ENERGY_PROFILE);
   const [energySaveState, setEnergySaveState] = useState<"idle" | "saving" | "success" | "error">("idle");
+  const [popupSummaryMessage, setPopupSummaryMessage] = useState("Updated energy profile");
 
   const [chatInput, setChatInput] = useState("");
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
+    {
+      id: 1,
+      role: "assistant",
+      text: "Hi! I'm your scheduling assistant. Ask me anything about your calendar."
+    }
+  ]);
 
   const [energyTab, setEnergyTab] = useState<EnergyTab>("day");
   const [auraMode, setAuraMode] = useState(false);
@@ -637,7 +644,7 @@ function App() {
       return;
     }
     chatAreaRef.current.scrollTop = chatAreaRef.current.scrollHeight;
-  }, [chatMessages, energySaveState]);
+  }, [chatMessages]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -808,19 +815,41 @@ function App() {
 
   function openAuraPopup() {
     setPopupStep(1);
+    setDayInput("");
+    setPopupSummaryMessage("Updated energy profile");
+    setEnergySaveState("idle");
     setOverlayOpen(true);
   }
 
   function closePopup() {
     setOverlayOpen(false);
+    setPopupStep(1);
+    setDayInput("");
+    setPopupSummaryMessage("Updated energy profile");
+    setEnergySaveState("idle");
   }
 
-  function submitDay() {
+  async function submitDay() {
+    const description = dayInput.trim();
+    if (!description || energySaveState === "saving") {
+      return;
+    }
+    setEnergySaveState("saving");
+    setPopupSummaryMessage("Updating energy profile...");
     setPopupStep(2);
+    try {
+      await api.updateEnergyProfile(userId, description);
+      await refreshCalendarFromBackend();
+      setEnergySaveState("success");
+      setPopupSummaryMessage("Updated energy profile");
+    } catch {
+      setEnergySaveState("error");
+      setPopupSummaryMessage("Unable to update energy profile");
+    }
   }
 
   function saveInsights() {
-    setOverlayOpen(false);
+    closePopup();
   }
 
   function handleCellClick(event: ReactMouseEvent<HTMLDivElement>, date: string, hour: number) {
@@ -945,43 +974,33 @@ function App() {
     setEventEditor((current) => ({ ...current, open: false }));
   }
 
-  async function submitEnergyProfileInput() {
-    const description = chatInput.trim();
-    if (!description || energySaveState === "saving") {
+  function sendChat() {
+    const message = chatInput.trim();
+    if (!message) {
       return;
     }
     const userMessageId = Date.now();
     setChatMessages((current) => [
       ...current,
-      { id: userMessageId, role: "user", text: description }
+      { id: userMessageId, role: "user", text: message }
     ]);
     setChatInput("");
-    setEnergySaveState("saving");
-    try {
-      await api.updateEnergyProfile(userId, description);
-      await refreshCalendarFromBackend();
-      setEnergySaveState("success");
-      setChatMessages((current) => [
-        ...current,
-        { id: userMessageId + 1, role: "assistant", text: "Energy profile updated" }
-      ]);
-    } catch (error) {
-      setEnergySaveState("error");
+    window.setTimeout(() => {
       setChatMessages((current) => [
         ...current,
         {
           id: userMessageId + 1,
           role: "assistant",
-          text: `Update failed: ${getErrorMessage(error)}`
+          text: "Thanks, I noted that."
         }
       ]);
-    }
+    }, 350);
   }
 
   function onChatKeyDown(event: ReactKeyboardEvent<HTMLTextAreaElement>) {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
-      void submitEnergyProfileInput();
+      sendChat();
     }
   }
 
@@ -1077,7 +1096,7 @@ function App() {
       <div className={`body-wrap ${activeTab === "calendar" ? "" : "hidden"}`} id="view-calendar">
         <aside className="sidebar">
           <div className="todo-bar">
-            <span className="todo-mode-label">{sidebarMode === "chat" ? "Energy Input" : "To-Do List"}</span>
+            <span className="todo-mode-label">{sidebarMode === "chat" ? "Chat" : "To-Do List"}</span>
             <span className="todo-chevron">▾</span>
             <select
               className="todo-select"
@@ -1086,7 +1105,7 @@ function App() {
               aria-label="Sidebar mode"
             >
               <option value="todo">To-Do List</option>
-              <option value="chat">Energy Input</option>
+              <option value="chat">Chat</option>
             </select>
           </div>
           <div
@@ -1157,40 +1176,25 @@ function App() {
                     {message.text}
                   </div>
                 ))}
-                {energySaveState === "saving" ? (
-                  <div className="chat-msg-ai">Updating energy profile...</div>
-                ) : null}
               </div>
               <div className="chat-input-box">
                 <textarea
                   className="chat-textarea"
-                  placeholder="Describe your energy patterns..."
+                  placeholder="Type your message..."
                   rows={2}
                   value={chatInput}
                   onChange={(event) => setChatInput(event.target.value)}
                   onKeyDown={onChatKeyDown}
                 />
                 <div className="chat-input-btns">
-                  <button
-                    className="chat-btn chat-mic"
-                    type="button"
-                    onClick={() => {
-                      void refreshCalendarFromBackend();
-                    }}
-                    aria-label="Reload energy profile"
-                    title="Reload energy profile"
-                  >
-                    ↺
-                  </button>
+                  <button className="chat-btn chat-mic" type="button">🎤</button>
                   <button
                     className="chat-btn chat-send aura-sphere"
                     type="button"
-                    onClick={() => {
-                      void submitEnergyProfileInput();
-                    }}
-                    disabled={energySaveState === "saving" || chatInput.trim().length === 0}
-                    aria-label="Save energy profile text"
-                    title="Save energy profile text"
+                    onClick={sendChat}
+                    disabled={chatInput.trim().length === 0}
+                    aria-label="Send chat message"
+                    title="Send chat message"
                   >
                     ↑
                   </button>
@@ -1471,7 +1475,7 @@ function App() {
             <div className="i-row">Intervals detected: {energyProfile.intervals.length}</div>
             {energyProfile.intervals.length === 0 ? (
               <div className="i-row">
-                No energy intervals yet. Use the Energy Input sidebar to add patterns.
+                No energy intervals yet. Use the Log Your Aura popup to add patterns.
               </div>
             ) : (
               energyProfile.intervals.map((interval) => (
@@ -1634,7 +1638,14 @@ function App() {
                 <button className="popup-mic-btn" type="button">
                   🎤
                 </button>
-                <button className="popup-send-btn aura-sphere" type="button" onClick={submitDay}>
+                <button
+                  className="popup-send-btn aura-sphere"
+                  type="button"
+                  onClick={() => {
+                    void submitDay();
+                  }}
+                  disabled={energySaveState === "saving" || dayInput.trim().length === 0}
+                >
                   ↑
                 </button>
               </div>
@@ -1675,15 +1686,13 @@ function App() {
           <div className={`${popupStep === 2 ? "" : "hidden"}`} style={{ display: popupStep === 2 ? "flex" : "none", width: "100%" }}>
             <div className="popup-left">
               <div className="aura-sphere popup-logo" />
-              <div className="popup-prompt">So in summary...</div>
-              <div className="summary-body">
-                Almost fell asleep during <span className="s-pill adv">ADV250</span>, did some light <strong>studying</strong>, felt happier after <strong>brunch</strong>, locked in during <span className="s-pill math">MATH257</span>, felt tired after class <strong>studying</strong> for <span className="s-pill cs">CS173</span>, and was happy to see friends during <strong>dinner</strong>.
-              </div>
+              <div className="popup-prompt">Status</div>
+              <div className="summary-body">{popupSummaryMessage}</div>
               <button className="save-btn" type="button" onClick={saveInsights}>
-                ✓ &nbsp;Save insights from today
+                Done
               </button>
               <button className="skip-link" type="button" onClick={closePopup}>
-                Do not include insights
+                Close
               </button>
             </div>
             <div className="popup-right">
