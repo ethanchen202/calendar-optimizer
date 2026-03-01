@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 import logging
 import re
+from datetime import date as DateType
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -27,6 +28,38 @@ EMOTION_ENERGY_LEVEL = {
     "frustrated": -2,
     "sad": -2,
 }
+
+WEEKDAY_NAME_TO_INDEX = {
+    "monday": 0,
+    "mon": 0,
+    "tuesday": 1,
+    "tue": 1,
+    "wednesday": 2,
+    "wed": 2,
+    "thursday": 3,
+    "thu": 3,
+    "friday": 4,
+    "fri": 4,
+    "saturday": 5,
+    "sat": 5,
+    "sunday": 6,
+    "sun": 6,
+}
+
+ENERGY_INTENT_TERMS = (
+    "energy",
+    "mood",
+    "productive",
+    "slump",
+    "tired",
+    "fatigue",
+    "fatigued",
+    "exhausted",
+    "drained",
+    "low energy",
+    "burnout",
+    "burned out",
+)
 
 logger = logging.getLogger(__name__)
 
@@ -87,13 +120,18 @@ def _coerce_chat_result(
         delta_payload = _normalize_ai_delta_payload(raw_delta)
         try:
             candidate_delta = ChatDelta.model_validate(delta_payload)
+            _align_delta_with_message_intent(candidate_delta, user_message, timezone_name)
             emotions = ai_emotions
             assistant_message = ai_assistant_message
             if not assistant_message:
                 assistant_message = _default_assistant_reply(candidate_delta)
             if not emotions:
                 emotions = _detect_emotions(user_message)
-            if not candidate_delta.energy_intervals_add and not candidate_delta.energy_interval_ids_remove:
+            if (
+                _should_apply_emotion_energy(user_message, candidate_delta)
+                and not candidate_delta.energy_intervals_add
+                and not candidate_delta.energy_interval_ids_remove
+            ):
                 candidate_delta.energy_intervals_add = _energy_intervals_from_emotions(
                     emotions,
                     timezone_name=timezone_name,
@@ -109,7 +147,11 @@ def _coerce_chat_result(
 
     fallback_delta = _fallback_delta(user_message, timezone_name, ai_client, user_state)
     fallback_emotions = ai_emotions or _detect_emotions(user_message)
-    if not fallback_delta.energy_intervals_add and not fallback_delta.energy_interval_ids_remove:
+    if (
+        _should_apply_emotion_energy(user_message, fallback_delta)
+        and not fallback_delta.energy_intervals_add
+        and not fallback_delta.energy_interval_ids_remove
+    ):
         fallback_delta.energy_intervals_add = _energy_intervals_from_emotions(
             fallback_emotions,
             timezone_name=timezone_name,
@@ -179,9 +221,12 @@ def _fallback_delta(
 ) -> ChatDelta:
     lowered = message.lower()
     delta = ChatDelta()
+    calendar_intent = _has_calendar_intent(message)
+    task_intent = _has_task_intent(message)
+    energy_intent = _has_energy_intent(message)
 
     add_task_match = re.search(r"(?:add task|create task)\s*[:\-]?\s*(.+)", message, flags=re.IGNORECASE)
-    if add_task_match:
+    if add_task_match and not calendar_intent:
         title = add_task_match.group(1).strip()
         title = re.split(r"\b(for|duration|priority|by|deadline)\b", title, maxsplit=1, flags=re.IGNORECASE)[0].strip()
         if title:
@@ -229,6 +274,10 @@ def _fallback_delta(
                         end=end_iso,
                     )
                 )
+    if calendar_intent and not delta.calendar_add:
+        inferred_event = _infer_calendar_event_from_message(message, timezone_name)
+        if inferred_event is not None:
+            delta.calendar_add.append(inferred_event)
 
     remove_event_match = re.search(
         r"(?:remove|delete)\s+(?:calendar\s+)?event\s*[:\-]?\s*(.+)",
@@ -247,13 +296,16 @@ def _fallback_delta(
         elif target:
             delta.calendar_title_contains_remove.append(target.lower())
 
-    intervals, _ = parse_description_to_intervals(
-        description=message,
-        timezone_name=timezone_name,
-        use_ai=False,
-        ai_client=ai_client,
-    )
-    delta.energy_intervals_add.extend(intervals)
+    if energy_intent:
+        intervals, _ = parse_description_to_intervals(
+            description=message,
+            timezone_name=timezone_name,
+            use_ai=False,
+            ai_client=ai_client,
+        )
+        delta.energy_intervals_add.extend(intervals)
+
+    _align_delta_with_message_intent(delta, message, timezone_name)
     return delta
 
 
@@ -508,3 +560,176 @@ def _replace_year_safely(value: datetime, new_year: int) -> datetime | None:
                 except ValueError:
                     continue
     return None
+
+
+def _has_energy_intent(message: str) -> bool:
+    lowered = message.lower()
+    return any(term in lowered for term in ENERGY_INTENT_TERMS)
+
+
+def _has_calendar_intent(message: str) -> bool:
+    lowered = message.lower()
+    return bool(
+        re.search(
+            r"\b(add|create|schedule|book|set up|remove|delete|cancel)\b.{0,40}\b(calendar|event|meeting|appointment|call|class|lecture|session)\b",
+            lowered,
+        )
+    )
+
+
+def _has_task_intent(message: str) -> bool:
+    lowered = message.lower()
+    return bool(
+        re.search(
+            r"\b(add|create|remove|delete|complete|finish)\b.{0,40}\b(task|todo|to-do|assignment|homework|project|chore)\b",
+            lowered,
+        )
+    )
+
+
+def _should_apply_emotion_energy(message: str, delta: ChatDelta) -> bool:
+    if _has_energy_intent(message):
+        return True
+    # Avoid writing mood-derived energy updates when user intent is structural.
+    return not (_has_calendar_intent(message) or _has_task_intent(message))
+
+
+def _align_delta_with_message_intent(delta: ChatDelta, message: str, timezone_name: str) -> None:
+    calendar_intent = _has_calendar_intent(message)
+    task_intent = _has_task_intent(message)
+    energy_intent = _has_energy_intent(message)
+
+    if calendar_intent and not task_intent:
+        if not delta.calendar_add:
+            inferred_event = _infer_calendar_event_from_message(message, timezone_name)
+            if inferred_event is not None:
+                delta.calendar_add.append(inferred_event)
+        # Do not let calendar commands get misclassified as task creation/deletion.
+        delta.tasks_add = []
+        delta.task_ids_remove = []
+        delta.task_title_contains_remove = []
+
+    if (calendar_intent or task_intent) and not energy_intent:
+        # Keep structural changes focused; avoid unintended energy profile mutations.
+        delta.energy_intervals_add = []
+        delta.energy_interval_ids_remove = []
+        delta.energy_clear_all = False
+        delta.energy_notes_append = None
+
+
+def _infer_calendar_event_from_message(message: str, timezone_name: str) -> CalendarEvent | None:
+    lowered = message.lower()
+    tz = _resolve_timezone(timezone_name)
+    now_local = datetime.now(tz)
+
+    time_range_match = re.search(
+        r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:-|to)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?",
+        lowered,
+    )
+    if not time_range_match:
+        return None
+
+    start_meridian = time_range_match.group(3) or time_range_match.group(6)
+    end_meridian = time_range_match.group(6) or time_range_match.group(3)
+    start_minutes = _to_minutes(
+        time_range_match.group(1),
+        time_range_match.group(2),
+        start_meridian,
+    )
+    end_minutes = _to_minutes(
+        time_range_match.group(4),
+        time_range_match.group(5),
+        end_meridian,
+    )
+    if start_minutes == end_minutes:
+        end_minutes = (start_minutes + 60) % (24 * 60)
+
+    event_date = _infer_event_date(lowered, now_local)
+    start_dt = datetime.combine(
+        event_date,
+        datetime.min.time(),
+        tzinfo=tz,
+    ) + timedelta(minutes=start_minutes)
+    end_dt = datetime.combine(
+        event_date,
+        datetime.min.time(),
+        tzinfo=tz,
+    ) + timedelta(minutes=end_minutes)
+    if end_dt <= start_dt:
+        end_dt += timedelta(days=1)
+
+    title = _infer_event_title(message, time_range_match.group(0))
+    return CalendarEvent(
+        id=f"chat_event_{int(datetime.now(timezone.utc).timestamp())}",
+        title=title,
+        start=start_dt,
+        end=end_dt,
+    )
+
+
+def _infer_event_date(lowered_message: str, now_local: datetime) -> DateType:
+    if "tomorrow" in lowered_message:
+        return now_local.date() + timedelta(days=1)
+    if "today" in lowered_message:
+        return now_local.date()
+    if "yesterday" in lowered_message:
+        return now_local.date() - timedelta(days=1)
+
+    next_day_match = re.search(
+        r"\bnext\s+(monday|mon|tuesday|tue|wednesday|wed|thursday|thu|friday|fri|saturday|sat|sunday|sun)\b",
+        lowered_message,
+    )
+    if next_day_match:
+        target = WEEKDAY_NAME_TO_INDEX[next_day_match.group(1)]
+        return _next_weekday(now_local.date(), target, force_next_week=True)
+
+    day_match = re.search(
+        r"\b(monday|mon|tuesday|tue|wednesday|wed|thursday|thu|friday|fri|saturday|sat|sunday|sun)\b",
+        lowered_message,
+    )
+    if day_match:
+        target = WEEKDAY_NAME_TO_INDEX[day_match.group(1)]
+        return _next_weekday(now_local.date(), target, force_next_week=False)
+
+    return now_local.date()
+
+
+def _next_weekday(start_day: DateType, target_weekday: int, force_next_week: bool) -> DateType:
+    days_ahead = (target_weekday - start_day.weekday() + 7) % 7
+    if days_ahead == 0:
+        days_ahead = 7
+    if force_next_week:
+        days_ahead += 7
+    return start_day + timedelta(days=days_ahead)
+
+
+def _to_minutes(hour: str, minute: str | None, meridian: str | None) -> int:
+    hour_num = int(hour)
+    minute_num = int(minute or "0")
+    if meridian:
+        meridian_lower = meridian.lower()
+        if hour_num == 12:
+            hour_num = 0
+        if meridian_lower == "pm":
+            hour_num += 12
+    return (hour_num % 24) * 60 + minute_num
+
+
+def _infer_event_title(message: str, time_expression: str) -> str:
+    title = re.sub(re.escape(time_expression), " ", message, count=1, flags=re.IGNORECASE)
+    title = re.sub(
+        r"\b(add|create|schedule|set up|book|calendar|event|on|at|from|to|for|tomorrow|today|yesterday|next)\b",
+        " ",
+        title,
+        flags=re.IGNORECASE,
+    )
+    title = re.sub(
+        r"\b(monday|mon|tuesday|tue|wednesday|wed|thursday|thu|friday|fri|saturday|sat|sunday|sun)\b",
+        " ",
+        title,
+        flags=re.IGNORECASE,
+    )
+    title = re.sub(r"\s+", " ", title).strip(" .,-")
+    if not title:
+        return "Calendar event"
+    return title[:200]
